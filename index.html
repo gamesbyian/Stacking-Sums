@@ -173,6 +173,7 @@
             const [mode, setMode] = useState('direct');
             const [gameOver, setGameOver] = useState(false);
             const [score, setScore] = useState(0);
+            const [guideOpen, setGuideOpen] = useState(true);
             
             // Timing & FX state
             const [progress, setProgress] = useState(0);
@@ -181,13 +182,13 @@
             const [uiScale, setUiScale] = useState(1);
 
             // Refs
-            const stateRef = useRef({ grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue });
+            const stateRef = useRef({ grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen });
             const tickTimerRef = useRef(null);
             const frameRef = useRef(null);
 
             useEffect(() => {
-                stateRef.current = { grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue };
-            }, [grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue]);
+                stateRef.current = { grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen };
+            }, [grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen]);
 
             // Unified Spawner
             const spawnTileForSliding = () => {
@@ -232,7 +233,7 @@
 
             // Interaction: Direct Drop
             const handleColumnClick = (colIndex) => {
-                if (stateRef.current.mode !== 'direct' || stateRef.current.gameOver) return;
+                if (stateRef.current.mode !== 'direct' || stateRef.current.gameOver || stateRef.current.guideOpen) return;
                 
                 const currentGrid = stateRef.current.grid;
                 let targetY = -1;
@@ -267,7 +268,7 @@
 
             useEffect(() => {
                 const handleKeyDown = (e) => {
-                    if (stateRef.current.mode !== 'sliding' || stateRef.current.gameOver) return;
+                    if (stateRef.current.mode !== 'sliding' || stateRef.current.gameOver || stateRef.current.guideOpen) return;
                     
                     switch(e.key) {
                         case 'ArrowLeft': moveActiveTile(-1, 0); break;
@@ -285,7 +286,7 @@
             }, []);
 
             useEffect(() => {
-                if (mode !== 'sliding' || gameOver) return;
+                if (mode !== 'sliding' || gameOver || guideOpen) return;
                 
                 const interval = setInterval(() => {
                     const { activeTile } = stateRef.current;
@@ -297,7 +298,7 @@
                 }, FALL_SPEED_MS);
                 
                 return () => clearInterval(interval);
-            }, [mode, gameOver]);
+            }, [mode, gameOver, guideOpen]);
 
             // Conveyor Logistics with Vibrate -> Explode -> Gravity sequence
             const evaluateRowsAndAdvance = () => {
@@ -368,7 +369,7 @@
             };
 
             useEffect(() => {
-                if (gameOver) return;
+                if (gameOver || guideOpen) return;
                 
                 let elapsedTime = 0;
                 
@@ -387,7 +388,7 @@
 
                 tickTimerRef.current = setInterval(tick, PROGRESS_INTERVAL_MS);
                 return () => clearInterval(tickTimerRef.current);
-            }, [gameOver]);
+            }, [gameOver, guideOpen]);
 
             const restart = () => {
                 setGrid(createEmptyGrid());
@@ -407,6 +408,8 @@
                 setMode(prev => prev === 'direct' ? 'sliding' : 'direct');
                 setActiveTile(null);
             };
+
+            const openGuide = () => setGuideOpen(true);
 
             const getRowSum = (rowIndex) => {
                 return grid[rowIndex].reduce((sum, cell) => sum + (cell !== null ? cell : 0), 0);
@@ -623,19 +626,91 @@
 
                         {/* Bottom Area: Mode Control */}
                         <div className="w-full flex justify-center mt-6">
-                            <div className="liquid-panel px-6 py-3 flex items-center gap-4">
+                            <div className="liquid-panel px-4 sm:px-6 py-3 flex items-center gap-3 sm:gap-4">
                                 <span className="text-[11px] font-bold uppercase tracking-widest opacity-60 text-white">Controls</span>
                                 <button 
                                     onClick={toggleMode}
-                                    className="bg-white/10 hover:bg-white/20 border border-white/20 rounded-full px-5 py-1.5 text-sm font-medium transition-colors text-white"
+                                    className="bg-white/10 hover:bg-white/20 border border-white/20 rounded-full px-4 sm:px-5 py-1.5 text-sm font-medium transition-colors text-white whitespace-nowrap"
                                 >
                                     {mode === 'direct' ? 'Direct Drop' : 'Sliding Placement'}
+                                </button>
+                                <button
+                                    onClick={openGuide}
+                                    className="bg-white/5 hover:bg-white/15 border border-white/15 rounded-full px-4 sm:px-5 py-1.5 text-sm font-medium transition-colors text-white whitespace-nowrap"
+                                >
+                                    Guide
                                 </button>
                             </div>
                         </div>
 
                     </div>
                     </div>
+
+                    {/* Guide Modal */}
+                    {guideOpen && (
+                        <div className="absolute inset-0 z-40 flex items-center justify-center bg-black/60 backdrop-blur-md p-3 sm:p-6">
+                            <div className="liquid-panel w-full max-w-2xl max-h-[calc(100svh-1.5rem)] sm:max-h-[calc(100svh-3rem)] flex flex-col overflow-hidden">
+                                <button
+                                    onClick={() => setGuideOpen(false)}
+                                    className="absolute top-4 right-4 z-20 w-8 h-8 rounded-full bg-white/10 hover:bg-white/20 border border-white/20 text-white/80 hover:text-white text-lg leading-none flex items-center justify-center transition-colors"
+                                    aria-label="Close guide"
+                                >
+                                    ×
+                                </button>
+
+                                <div className="px-5 sm:px-8 pt-6 sm:pt-8 pb-4 border-b border-white/10">
+                                    <h2 className="text-3xl sm:text-4xl font-bold tracking-tight text-white">How to Play</h2>
+                                    <p className="mt-2 text-sm sm:text-base text-white/80 pr-8">Build row sums that match the moving conveyor targets before the board fills up.</p>
+                                </div>
+
+                                <div className="flex-1 overflow-y-auto px-5 sm:px-8 py-5 sm:py-6 space-y-6">
+                                    <section>
+                                        <h3 className="text-xs uppercase tracking-widest font-bold text-white/60 mb-3">Rules</h3>
+                                        <ul className="space-y-2 text-sm sm:text-base text-white/90 leading-relaxed">
+                                            <li>• Drop number tiles into the grid.</li>
+                                            <li>• Each row has a target value shown on the conveyor to the right.</li>
+                                            <li>• Every 10 seconds, the conveyor advances and all row targets shift down by one.</li>
+                                            <li>• If a row’s total exactly matches its current target, that row clears.</li>
+                                            <li>• Cleared rows explode and disappear, and everything above falls down.</li>
+                                            <li>• The game ends when the grid fills to the top.</li>
+                                        </ul>
+                                    </section>
+
+                                    <section>
+                                        <h3 className="text-xs uppercase tracking-widest font-bold text-white/60 mb-3">Gameplay</h3>
+                                        <ul className="space-y-2 text-sm sm:text-base text-white/90 leading-relaxed">
+                                            <li>• In Direct Drop mode, click a column to drop the current tile into it.</li>
+                                            <li>• In Sliding Placement mode, move the falling tile with the arrow keys.</li>
+                                            <li>• Plan ahead using the next-tile preview.</li>
+                                            <li>• Set up rows that are close to matching, then use later tiles or falling cascades to finish them.</li>
+                                            <li>• Chain reactions can clear multiple rows and score big points.</li>
+                                        </ul>
+                                    </section>
+
+                                    <section>
+                                        <h3 className="text-xs uppercase tracking-widest font-bold text-white/60 mb-3">UI Elements</h3>
+                                        <ul className="space-y-2 text-sm sm:text-base text-white/90 leading-relaxed">
+                                            <li>• Next Tiles: shows the current tile and the one after it.</li>
+                                            <li>• Conveyor Timer: shows when the targets will advance.</li>
+                                            <li>• Score: tracks your points.</li>
+                                            <li>• Conveyor Targets: the row goals you are trying to match.</li>
+                                            <li>• Controls: lets you switch between Direct Drop and Sliding Placement.</li>
+                                            <li>• Guide: reopens this help screen.</li>
+                                        </ul>
+                                    </section>
+                                </div>
+
+                                <div className="px-5 sm:px-8 py-4 sm:py-5 border-t border-white/10 bg-black/20">
+                                    <button
+                                        onClick={() => setGuideOpen(false)}
+                                        className="w-full bg-white text-gray-900 px-8 py-3 rounded-full font-bold text-lg shadow-[0_4px_14px_0_rgba(255,255,255,0.2)] hover:shadow-[0_6px_20px_rgba(255,255,255,0.3)] hover:bg-opacity-90 transition-all"
+                                    >
+                                        Play
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
 
                     {/* Game Over Modal */}
                     {gameOver && (
