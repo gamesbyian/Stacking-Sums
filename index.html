@@ -145,7 +145,7 @@
     <div id="root"></div>
 
     <script type="text/babel">
-        const { useState, useEffect, useRef } = React;
+        const { useState, useEffect, useRef, useCallback } = React;
 
         // Constants
         const ROWS = 12;
@@ -178,10 +178,12 @@
             const [progress, setProgress] = useState(0);
             const [clearingRows, setClearingRows] = useState([]);
             const [explodingParticles, setExplodingParticles] = useState([]);
+            const [uiScale, setUiScale] = useState(1);
 
             // Refs
             const stateRef = useRef({ grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue });
             const tickTimerRef = useRef(null);
+            const frameRef = useRef(null);
 
             useEffect(() => {
                 stateRef.current = { grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue };
@@ -410,10 +412,39 @@
                 return grid[rowIndex].reduce((sum, cell) => sum + (cell !== null ? cell : 0), 0);
             };
 
+            const updateUiScale = useCallback(() => {
+                const frame = frameRef.current;
+                if (!frame) return;
+
+                const availableWidth = window.innerWidth - 16;
+                const availableHeight = window.innerHeight - 16;
+                const widthScale = availableWidth / frame.offsetWidth;
+                const heightScale = availableHeight / frame.offsetHeight;
+                const nextScale = Math.min(1, widthScale, heightScale);
+
+                setUiScale(Number.isFinite(nextScale) ? Math.max(nextScale, 0.6) : 1);
+            }, []);
+
+            useEffect(() => {
+                updateUiScale();
+                window.addEventListener('resize', updateUiScale);
+                window.addEventListener('orientationchange', updateUiScale);
+                return () => {
+                    window.removeEventListener('resize', updateUiScale);
+                    window.removeEventListener('orientationchange', updateUiScale);
+                };
+            }, [updateUiScale]);
+
             return (
-                <div className="w-screen h-screen flex flex-col items-center justify-center p-4">
-                    
-                    <div className="z-10 w-fit flex flex-col items-stretch max-w-full">
+                <div className="w-screen h-[100svh] flex flex-col items-center justify-center p-2 sm:p-4 overflow-hidden">
+                    <div
+                        style={{
+                            transform: `scale(${uiScale})`,
+                            transformOrigin: 'center center',
+                            transition: 'transform 180ms ease-out'
+                        }}
+                    >
+                    <div ref={frameRef} className="z-10 w-fit flex flex-col items-stretch max-w-full">
                         
                         {/* Header Area */}
                         <div className="w-full flex justify-between items-stretch mb-6 gap-4">
@@ -603,6 +634,7 @@
                             </div>
                         </div>
 
+                    </div>
                     </div>
 
                     {/* Game Over Modal */}
