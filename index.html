@@ -157,8 +157,29 @@
         const FALL_SPEED_MS = 800;
         const DIRECT_DROP_ANIM_MS = 220;
         const DEMO_THINK_MS = 420;
+        const DEMO_PAUSE_JITTER_MS = 180;
+        const DEMO_LOOKAHEAD_FACTOR = 0.35;
         const CELL_SIZE = 56;
         const PAD = 8; 
+
+        const DEMO_WEIGHTS = {
+            exactMatch: 1800,
+            near1: 380,
+            near2: 220,
+            near3: 90,
+            improveGap: 60,
+            worsenGap: -90,
+            overshootUnit: -180,
+            overshootQuad: -26,
+            investedRowBonus: 75,
+            junkRowPenalty: -38,
+            landedTopDanger: -520,
+            heightBase: -28,
+            heightSquared: -18,
+            maxHeightDanger: -90,
+            skylineSpreadBonus: 18,
+            activeRowBonus: 8
+        };
 
         // Utility
         const randomInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
@@ -283,48 +304,122 @@
                 return legal;
             };
 
-            const scoreDemoMove = (sourceGrid, sourceConveyor, colIndex, valToDrop) => {
-                const landingRow = getLandingRowForColumn(sourceGrid, colIndex);
-                if (landingRow === -1) return Number.NEGATIVE_INFINITY;
+            const getColumnHeights = (sourceGrid) => {
+                const heights = [];
+                for (let col = 0; col < COLS; col++) {
+                    let firstFilled = ROWS;
+                    for (let row = 0; row < ROWS; row++) {
+                        if (sourceGrid[row][col] !== null) {
+                            firstFilled = row;
+                            break;
+                        }
+                    }
+                    heights.push(firstFilled === ROWS ? 0 : ROWS - firstFilled);
+                }
+                return heights;
+            };
 
-                const row = sourceGrid[landingRow];
-                const rowSum = row.reduce((sum, cell) => sum + (cell !== null ? cell : 0), 0);
-                const nextSum = rowSum + valToDrop;
-                const target = sourceConveyor[landingRow];
-                const diff = target - nextSum;
-                const overshoot = nextSum - target;
-                const heightAfterDrop = landingRow + 1;
+            const simulateDirectDropResult = (sourceGrid, colIndex, valToDrop) => {
+                const landingRow = getLandingRowForColumn(sourceGrid, colIndex);
+                if (landingRow === -1) return null;
+
+                const nextGrid = sourceGrid.map(row => [...row]);
+                nextGrid[landingRow][colIndex] = valToDrop;
+                return { nextGrid, landingRow, colIndex };
+            };
+
+            const scoreRowProximity = (sum, target, hasTiles) => {
+                if (!hasTiles) return 0;
+                const gap = target - sum;
+                const absGap = Math.abs(gap);
+                if (gap === 0) return DEMO_WEIGHTS.exactMatch;
+                if (gap === 1) return DEMO_WEIGHTS.near1;
+                if (gap === 2) return DEMO_WEIGHTS.near2;
+                if (gap === 3) return DEMO_WEIGHTS.near3;
 
                 let score = 0;
-                if (diff === 0) score += 1200;
-                else if (diff > 0 && diff <= 2) score += 260 - (diff * 40);
-                else if (diff > 2) score += Math.max(120 - diff * 10, -120);
-                if (overshoot > 0) score -= 130 + (overshoot * 45);
-                score -= heightAfterDrop * 7;
-
-                // Slightly prefer keeping nearby rows flexible.
-                if (landingRow > 0) {
-                    const aboveFilled = sourceGrid[landingRow - 1].filter(c => c !== null).length;
-                    score -= aboveFilled * 3;
+                if (gap < 0) {
+                    const overshoot = Math.abs(gap);
+                    score += (overshoot * DEMO_WEIGHTS.overshootUnit) + (overshoot * overshoot * DEMO_WEIGHTS.overshootQuad);
+                } else if (absGap >= 7) {
+                    score += DEMO_WEIGHTS.junkRowPenalty * Math.min(absGap - 6, 4);
                 }
+                return score;
+            };
+
+            const evaluateSimulatedMove = (sourceGrid, sourceConveyor, simulated) => {
+                if (!simulated) return Number.NEGATIVE_INFINITY;
+                const { nextGrid, landingRow, colIndex } = simulated;
+
+                let score = 0;
+                const landingTarget = sourceConveyor[landingRow];
+                const beforeLandingSum = getRowSumFromGrid(sourceGrid, landingRow);
+                const afterLandingSum = getRowSumFromGrid(nextGrid, landingRow);
+                const beforeGap = Math.abs(landingTarget - beforeLandingSum);
+                const afterGap = Math.abs(landingTarget - afterLandingSum);
+                const landingHadTiles = sourceGrid[landingRow].some(cell => cell !== null);
+
+                score += scoreRowProximity(afterLandingSum, landingTarget, true);
+                score += (beforeGap - afterGap) * DEMO_WEIGHTS.improveGap;
+                if (afterGap > beforeGap) score += DEMO_WEIGHTS.worsenGap;
+                if (landingHadTiles && afterGap <= beforeGap) score += DEMO_WEIGHTS.investedRowBonus;
+
+                for (let row = 0; row < ROWS; row++) {
+                    if (row === landingRow) continue;
+                    const rowHasTiles = nextGrid[row].some(cell => cell !== null);
+                    const rowSum = getRowSumFromGrid(nextGrid, row);
+                    score += scoreRowProximity(rowSum, sourceConveyor[row], rowHasTiles) * 0.24;
+                    if (rowHasTiles) score += DEMO_WEIGHTS.activeRowBonus;
+                }
+
+                const heights = getColumnHeights(nextGrid);
+                const maxHeight = Math.max(...heights);
+                const minHeight = Math.min(...heights);
+                heights.forEach(h => {
+                    score += (h * DEMO_WEIGHTS.heightBase) + (h * h * DEMO_WEIGHTS.heightSquared);
+                    if (h >= ROWS - 1) score += DEMO_WEIGHTS.landedTopDanger;
+                });
+
+                score += maxHeight * DEMO_WEIGHTS.maxHeightDanger;
+                score += (maxHeight - minHeight) * DEMO_WEIGHTS.skylineSpreadBonus;
+
+                const topDanger = landingRow <= 2 ? (3 - landingRow) : 0;
+                if (topDanger > 0) score += topDanger * DEMO_WEIGHTS.landedTopDanger;
+
+                // Small center bias keeps the bot from tunneling one side.
+                score -= Math.abs(colIndex - ((COLS - 1) / 2)) * 8;
 
                 return score;
             };
 
-            const chooseDemoColumn = (sourceGrid, sourceConveyor, valToDrop) => {
+            const chooseDemoColumn = (sourceGrid, sourceConveyor, currentTile, nextTile) => {
                 const legalCols = getLegalDirectDropColumns(sourceGrid);
-                if (!legalCols.length) return -1;
+                if (!legalCols.length) return { col: -1, score: Number.NEGATIVE_INFINITY };
 
                 let bestCol = legalCols[0];
                 let bestScore = Number.NEGATIVE_INFINITY;
                 legalCols.forEach(col => {
-                    const moveScore = scoreDemoMove(sourceGrid, sourceConveyor, col, valToDrop);
-                    if (moveScore > bestScore) {
-                        bestScore = moveScore;
+                    const currentSim = simulateDirectDropResult(sourceGrid, col, currentTile);
+                    const currentScore = evaluateSimulatedMove(sourceGrid, sourceConveyor, currentSim);
+
+                    let combinedScore = currentScore;
+                    if (nextTile !== undefined && nextTile !== null && currentSim) {
+                        const nextLegalCols = getLegalDirectDropColumns(currentSim.nextGrid);
+                        let nextBest = Number.NEGATIVE_INFINITY;
+                        nextLegalCols.forEach(nextCol => {
+                            const nextSim = simulateDirectDropResult(currentSim.nextGrid, nextCol, nextTile);
+                            const nextScore = evaluateSimulatedMove(currentSim.nextGrid, sourceConveyor, nextSim);
+                            if (nextScore > nextBest) nextBest = nextScore;
+                        });
+                        if (nextBest !== Number.NEGATIVE_INFINITY) combinedScore += nextBest * DEMO_LOOKAHEAD_FACTOR;
+                    }
+
+                    if (combinedScore > bestScore) {
+                        bestScore = combinedScore;
                         bestCol = col;
                     }
                 });
-                return bestCol;
+                return { col: bestCol, score: bestScore };
             };
 
             const startDirectDrop = (colIndex) => {
@@ -406,16 +501,16 @@
             }, [mode, gameOver, guideOpen]);
 
             useEffect(() => {
-                if (!demoMode || gameOver || guideOpen || mode !== 'direct' || animatingDrop) return;
+                if (!demoMode || gameOver || guideOpen || mode !== 'direct' || animatingDrop || conveyorAnim || clearingRows.length > 0 || explodingParticles.length > 0) return;
 
                 demoTimerRef.current = setTimeout(() => {
                     const { grid, conveyor, queue } = stateRef.current;
-                    const chosenCol = chooseDemoColumn(grid, conveyor, queue[0]);
-                    if (chosenCol !== -1) startDirectDrop(chosenCol);
-                }, DEMO_THINK_MS);
+                    const choice = chooseDemoColumn(grid, conveyor, queue[0], queue[1]);
+                    if (choice.col !== -1) startDirectDrop(choice.col);
+                }, DEMO_THINK_MS + randomInt(0, DEMO_PAUSE_JITTER_MS));
 
                 return () => clearTimeout(demoTimerRef.current);
-            }, [demoMode, gameOver, guideOpen, mode, animatingDrop, grid, conveyor, queue]);
+            }, [demoMode, gameOver, guideOpen, mode, animatingDrop, grid, conveyor, queue, conveyorAnim, clearingRows, explodingParticles]);
 
             useEffect(() => {
                 if (gameOver) setDemoMode(false);
@@ -541,7 +636,9 @@
                 return () => clearInterval(tickTimerRef.current);
             }, [gameOver, guideOpen, currentTickMs]);
 
-            const restart = () => {
+            const resetGameState = ({ nextDemoMode = false, nextMode = stateRef.current.mode } = {}) => {
+                clearTimeout(directDropCommitRef.current);
+                clearTimeout(demoTimerRef.current);
                 setGrid(createEmptyGrid());
                 setConveyor(Array.from({ length: ROWS }, generateTarget));
                 setIncomingTarget(generateTarget());
@@ -556,22 +653,30 @@
                 setComboText('');
                 setAdvanceCount(0);
                 setAnimatingDrop(null);
-                clearTimeout(directDropCommitRef.current);
+                setMode(nextMode);
+                setDemoMode(nextDemoMode);
+            };
+
+            const restart = () => {
+                resetGameState({
+                    nextDemoMode: stateRef.current.demoMode,
+                    nextMode: stateRef.current.demoMode ? 'direct' : stateRef.current.mode
+                });
             };
 
             const toggleMode = () => {
-                if (demoMode) setDemoMode(false);
+                if (demoMode) return;
                 setMode(prev => prev === 'direct' ? 'sliding' : 'direct');
                 setActiveTile(null);
             };
 
             const toggleDemoMode = () => {
-                if (gameOver) return;
-                if (!demoMode) {
-                    setMode('direct');
-                    setActiveTile(null);
+                const isTurningOn = !stateRef.current.demoMode;
+                if (isTurningOn) {
+                    resetGameState({ nextDemoMode: true, nextMode: 'direct' });
+                    return;
                 }
-                setDemoMode(prev => !prev);
+                resetGameState({ nextDemoMode: false, nextMode: 'direct' });
             };
 
             const openGuide = () => setGuideOpen(true);
@@ -841,7 +946,8 @@
                                 <span className="text-[11px] font-bold uppercase tracking-widest opacity-60 text-white">Controls</span>
                                 <button 
                                     onClick={toggleMode}
-                                    className="bg-white/10 hover:bg-white/20 border border-white/20 rounded-full px-4 sm:px-5 py-1.5 text-sm font-medium transition-colors text-white whitespace-nowrap"
+                                    disabled={demoMode}
+                                    className={`border rounded-full px-4 sm:px-5 py-1.5 text-sm font-medium transition-colors text-white whitespace-nowrap ${demoMode ? 'bg-white/5 border-white/10 opacity-50 cursor-not-allowed' : 'bg-white/10 hover:bg-white/20 border-white/20'}`}
                                 >
                                     {mode === 'direct' ? 'Direct Drop' : 'Sliding Placement'}
                                 </button>
