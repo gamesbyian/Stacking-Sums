@@ -150,7 +150,9 @@
         // Constants
         const ROWS = 12;
         const COLS = 6;
-        const TICK_MS = 10000;
+        const MAX_TICK_MS = 15000;
+        const MIN_TICK_MS = 10000;
+        const TICK_RAMP_ADVANCES = 20;
         const PROGRESS_INTERVAL_MS = 50;
         const FALL_SPEED_MS = 800;
         const CELL_SIZE = 56;
@@ -158,8 +160,35 @@
 
         // Utility
         const randomInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
-        const generateTile = () => randomInt(0, 9);
-        const generateTarget = () => randomInt(5, 30);
+        const weightedPick = (weightedValues) => {
+            const totalWeight = weightedValues.reduce((sum, entry) => sum + entry.weight, 0);
+            let roll = Math.random() * totalWeight;
+            for (const entry of weightedValues) {
+                roll -= entry.weight;
+                if (roll <= 0) return entry.value;
+            }
+            return weightedValues[weightedValues.length - 1].value;
+        };
+        // Bias toward smaller digits so players can shape sums incrementally.
+        const generateTile = () => weightedPick([
+            { value: 0, weight: 7 },
+            { value: 1, weight: 12 },
+            { value: 2, weight: 12 },
+            { value: 3, weight: 11 },
+            { value: 4, weight: 10 },
+            { value: 5, weight: 9 },
+            { value: 6, weight: 8 },
+            { value: 7, weight: 5 },
+            { value: 8, weight: 4 },
+            { value: 9, weight: 3 }
+        ]);
+        // Center targets in a humane mid-range while still allowing occasional high totals.
+        const generateTarget = () => weightedPick([
+            { value: randomInt(6, 10), weight: 5 },
+            { value: randomInt(11, 16), weight: 11 },
+            { value: randomInt(17, 22), weight: 8 },
+            { value: randomInt(23, 28), weight: 4 }
+        ]);
         const createEmptyGrid = () => Array.from({ length: ROWS }, () => Array(COLS).fill(null));
 
         const App = () => {
@@ -179,16 +208,18 @@
             const [progress, setProgress] = useState(0);
             const [clearingRows, setClearingRows] = useState([]);
             const [explodingParticles, setExplodingParticles] = useState([]);
+            const [comboText, setComboText] = useState('');
             const [uiScale, setUiScale] = useState(1);
+            const [advanceCount, setAdvanceCount] = useState(0);
 
             // Refs
-            const stateRef = useRef({ grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen });
+            const stateRef = useRef({ grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount });
             const tickTimerRef = useRef(null);
             const frameRef = useRef(null);
 
             useEffect(() => {
-                stateRef.current = { grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen };
-            }, [grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen]);
+                stateRef.current = { grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount };
+            }, [grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount]);
 
             // Unified Spawner
             const spawnTileForSliding = () => {
@@ -300,22 +331,43 @@
                 return () => clearInterval(interval);
             }, [mode, gameOver, guideOpen]);
 
+            const getRowSumFromGrid = (sourceGrid, rowIndex) => sourceGrid[rowIndex].reduce((sum, cell) => sum + (cell !== null ? cell : 0), 0);
+
+            const getRowDelta = (rowIndex, targetValue = conveyor[rowIndex]) => {
+                const sum = getRowSumFromGrid(grid, rowIndex);
+                const hasTiles = grid[rowIndex].some(cell => cell !== null);
+                return { sum, hasTiles, difference: Math.abs(targetValue - sum) };
+            };
+
+            const getTickDuration = (advances) => {
+                const t = Math.min(advances / TICK_RAMP_ADVANCES, 1);
+                return Math.round(MAX_TICK_MS - (MAX_TICK_MS - MIN_TICK_MS) * t);
+            };
+
+            const getCascadeScore = (clearedRows) => {
+                const base = clearedRows * 100;
+                const bonus = clearedRows > 1 ? (clearedRows - 1) * clearedRows * 50 : 0;
+                return base + bonus;
+            };
+
             // Conveyor Logistics with Vibrate -> Explode -> Gravity sequence
             const evaluateRowsAndAdvance = () => {
-                const { grid, conveyor, incomingTarget } = stateRef.current;
+                const { grid, conveyor, incomingTarget, advanceCount } = stateRef.current;
                 
                 setConveyorAnim(true);
                 
                 setTimeout(() => {
-                    let newConveyor = [incomingTarget, ...conveyor.slice(0, -1)];
-                    
+                    const newConveyor = [incomingTarget, ...conveyor.slice(0, -1)];
+                    const nextAdvanceCount = advanceCount + 1;
+
                     setConveyorAnim(false);
                     setConveyor(newConveyor);
                     setIncomingTarget(generateTarget());
+                    setAdvanceCount(nextAdvanceCount);
                     
                     let cleared = [];
                     for (let r = 0; r < ROWS; r++) {
-                        const rowSum = grid[r].reduce((sum, cell) => sum + (cell !== null ? cell : 0), 0);
+                        const rowSum = getRowSumFromGrid(grid, r);
                         const hasTiles = grid[r].some(cell => cell !== null);
                         
                         if (hasTiles && rowSum === newConveyor[r]) {
@@ -326,7 +378,14 @@
                     if (cleared.length > 0) {
                         // 1. Begin 1-second vibration phase
                         setClearingRows(cleared);
-                        setScore(s => s + (cleared.length * 100));
+                        const cascadeScore = getCascadeScore(cleared.length);
+                        setScore(s => s + cascadeScore);
+
+                        if (cleared.length > 1) {
+                            const comboLabel = cleared.length === 2 ? 'DOUBLE CLEAR' : cleared.length === 3 ? 'TRIPLE CLEAR' : `CASCADE x${cleared.length}`;
+                            setComboText(`${comboLabel} +${cascadeScore}`);
+                            setTimeout(() => setComboText(''), 1200);
+                        }
 
                         // Generate future explosion particle data
                         const particlesToSpawn = [];
@@ -368,16 +427,18 @@
                 }, 400); // Conveyor physical slide duration
             };
 
+            const currentTickMs = getTickDuration(advanceCount);
+
             useEffect(() => {
                 if (gameOver || guideOpen) return;
-                
-                let elapsedTime = 0;
-                
+
+                let elapsedTime = (progress / 100) * currentTickMs;
+
                 const tick = () => {
                     elapsedTime += PROGRESS_INTERVAL_MS;
-                    const percentage = (elapsedTime / TICK_MS) * 100;
-                    
-                    if (elapsedTime >= TICK_MS) {
+                    const percentage = Math.min((elapsedTime / currentTickMs) * 100, 100);
+
+                    if (elapsedTime >= currentTickMs) {
                         evaluateRowsAndAdvance();
                         elapsedTime = 0;
                         setProgress(0);
@@ -388,7 +449,7 @@
 
                 tickTimerRef.current = setInterval(tick, PROGRESS_INTERVAL_MS);
                 return () => clearInterval(tickTimerRef.current);
-            }, [gameOver, guideOpen]);
+            }, [gameOver, guideOpen, currentTickMs]);
 
             const restart = () => {
                 setGrid(createEmptyGrid());
@@ -402,6 +463,8 @@
                 setProgress(0);
                 setClearingRows([]);
                 setExplodingParticles([]);
+                setComboText('');
+                setAdvanceCount(0);
             };
 
             const toggleMode = () => {
@@ -411,9 +474,7 @@
 
             const openGuide = () => setGuideOpen(true);
 
-            const getRowSum = (rowIndex) => {
-                return grid[rowIndex].reduce((sum, cell) => sum + (cell !== null ? cell : 0), 0);
-            };
+            const getRowSum = (rowIndex) => getRowSumFromGrid(grid, rowIndex);
 
             const updateUiScale = useCallback(() => {
                 const frame = frameRef.current;
@@ -481,7 +542,7 @@
                                             />
                                         </svg>
                                         <div className="absolute font-bold text-xs text-white">
-                                            {Math.ceil((TICK_MS - (progress / 100 * TICK_MS)) / 1000)}s
+                                            {Math.ceil((currentTickMs - (progress / 100 * currentTickMs)) / 1000)}s
                                         </div>
                                     </div>
                                 </div>
@@ -491,11 +552,14 @@
                             <div className="liquid-panel px-8 py-3 flex flex-col items-center justify-center min-w-[120px]">
                                 <div className="text-[10px] uppercase tracking-widest opacity-60 mb-1 font-bold text-white">Score</div>
                                 <div className="text-2xl font-bold tracking-tight text-white">{score}</div>
+                                <div className={`mt-1 text-[10px] uppercase tracking-[0.14em] text-emerald-200/90 transition-opacity duration-300 ${comboText ? 'opacity-100' : 'opacity-0'}`}>
+                                    {comboText || ' '}
+                                </div>
                             </div>
                         </div>
 
                         {/* Main Game Area */}
-                        <div className="w-full flex gap-6 justify-center">
+                        <div className="w-full flex gap-3 sm:gap-4 justify-center">
                             
                             {/* Center: Game Board */}
                             <div className="liquid-panel p-3 shadow-2xl">
@@ -569,6 +633,35 @@
                                         </div>
                                     ))}
                                 </div>
+                            </div>
+
+                            {/* Mid: Row Sum Indicators */}
+                            <div className="flex flex-col justify-start px-1 sm:px-2"
+                                style={{
+                                    height: (ROWS * CELL_SIZE) + (PAD * 2) + 'px',
+                                    paddingTop: `${PAD}px`,
+                                    paddingBottom: `${PAD}px`
+                                }}
+                            >
+                                {conveyor.map((target, idx) => {
+                                    const { sum, hasTiles, difference } = getRowDelta(idx, target);
+                                    const stateClass = !hasTiles
+                                        ? 'text-white/15'
+                                        : difference === 0
+                                            ? 'text-emerald-200/95 drop-shadow-[0_0_10px_rgba(100,255,160,0.4)] font-semibold'
+                                            : difference <= 1
+                                                ? 'text-white/80'
+                                                : difference <= 2
+                                                    ? 'text-white/60'
+                                                    : 'text-white/35';
+                                    return (
+                                        <div key={`sum-${idx}`} className="flex items-center justify-center" style={{ height: `${CELL_SIZE}px` }}>
+                                            <span className={`text-sm sm:text-base tracking-tight transition-all duration-300 ${stateClass}`}>
+                                                {hasTiles ? sum : ''}
+                                            </span>
+                                        </div>
+                                    );
+                                })}
                             </div>
 
                             {/* Right: Conveyor Targets */}
@@ -669,7 +762,7 @@
                                         <ul className="space-y-2 text-sm sm:text-base text-white/90 leading-relaxed">
                                             <li>• Drop number tiles into the grid.</li>
                                             <li>• Each row has a target value shown on the conveyor to the right.</li>
-                                            <li>• Every 10 seconds, the conveyor advances and all row targets shift down by one.</li>
+                                            <li>• The conveyor starts slower and ramps toward a 10-second advance pace as the run progresses.</li>
                                             <li>• If a row’s total exactly matches its current target, that row clears.</li>
                                             <li>• Cleared rows explode and disappear, and everything above falls down.</li>
                                             <li>• The game ends when the grid fills to the top.</li>
@@ -694,6 +787,7 @@
                                             <li>• Conveyor Timer: shows when the targets will advance.</li>
                                             <li>• Score: tracks your points.</li>
                                             <li>• Conveyor Targets: the row goals you are trying to match.</li>
+                                            <li>• Row Sums: the thin middle column showing each row’s live total.</li>
                                             <li>• Controls: lets you switch between Direct Drop and Sliding Placement.</li>
                                             <li>• Guide: reopens this help screen.</li>
                                         </ul>
