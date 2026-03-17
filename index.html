@@ -155,6 +155,8 @@
         const TICK_RAMP_ADVANCES = 20;
         const PROGRESS_INTERVAL_MS = 50;
         const FALL_SPEED_MS = 800;
+        const DIRECT_DROP_ANIM_MS = 220;
+        const DEMO_THINK_MS = 420;
         const CELL_SIZE = 56;
         const PAD = 8; 
 
@@ -203,6 +205,8 @@
             const [gameOver, setGameOver] = useState(false);
             const [score, setScore] = useState(0);
             const [guideOpen, setGuideOpen] = useState(true);
+            const [animatingDrop, setAnimatingDrop] = useState(null);
+            const [demoMode, setDemoMode] = useState(false);
             
             // Timing & FX state
             const [progress, setProgress] = useState(0);
@@ -213,13 +217,15 @@
             const [advanceCount, setAdvanceCount] = useState(0);
 
             // Refs
-            const stateRef = useRef({ grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount });
+            const stateRef = useRef({ grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount, animatingDrop, demoMode });
             const tickTimerRef = useRef(null);
             const frameRef = useRef(null);
+            const directDropCommitRef = useRef(null);
+            const demoTimerRef = useRef(null);
 
             useEffect(() => {
-                stateRef.current = { grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount };
-            }, [grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount]);
+                stateRef.current = { grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount, animatingDrop, demoMode };
+            }, [grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount, animatingDrop, demoMode]);
 
             // Unified Spawner
             const spawnTileForSliding = () => {
@@ -262,24 +268,92 @@
                 }
             }, [activeTile, gameOver, mode]);
 
-            // Interaction: Direct Drop
-            const handleColumnClick = (colIndex) => {
-                if (stateRef.current.mode !== 'direct' || stateRef.current.gameOver || stateRef.current.guideOpen) return;
-                
-                const currentGrid = stateRef.current.grid;
-                let targetY = -1;
-                
+            const getLandingRowForColumn = (sourceGrid, colIndex) => {
                 for (let r = ROWS - 1; r >= 0; r--) {
-                    if (currentGrid[r][colIndex] === null) {
-                        targetY = r;
-                        break;
-                    }
+                    if (sourceGrid[r][colIndex] === null) return r;
+                }
+                return -1;
+            };
+
+            const getLegalDirectDropColumns = (sourceGrid) => {
+                const legal = [];
+                for (let col = 0; col < COLS; col++) {
+                    if (getLandingRowForColumn(sourceGrid, col) !== -1) legal.push(col);
+                }
+                return legal;
+            };
+
+            const scoreDemoMove = (sourceGrid, sourceConveyor, colIndex, valToDrop) => {
+                const landingRow = getLandingRowForColumn(sourceGrid, colIndex);
+                if (landingRow === -1) return Number.NEGATIVE_INFINITY;
+
+                const row = sourceGrid[landingRow];
+                const rowSum = row.reduce((sum, cell) => sum + (cell !== null ? cell : 0), 0);
+                const nextSum = rowSum + valToDrop;
+                const target = sourceConveyor[landingRow];
+                const diff = target - nextSum;
+                const overshoot = nextSum - target;
+                const heightAfterDrop = landingRow + 1;
+
+                let score = 0;
+                if (diff === 0) score += 1200;
+                else if (diff > 0 && diff <= 2) score += 260 - (diff * 40);
+                else if (diff > 2) score += Math.max(120 - diff * 10, -120);
+                if (overshoot > 0) score -= 130 + (overshoot * 45);
+                score -= heightAfterDrop * 7;
+
+                // Slightly prefer keeping nearby rows flexible.
+                if (landingRow > 0) {
+                    const aboveFilled = sourceGrid[landingRow - 1].filter(c => c !== null).length;
+                    score -= aboveFilled * 3;
                 }
 
-                if (targetY !== -1) {
-                    const valToDrop = stateRef.current.queue[0];
+                return score;
+            };
+
+            const chooseDemoColumn = (sourceGrid, sourceConveyor, valToDrop) => {
+                const legalCols = getLegalDirectDropColumns(sourceGrid);
+                if (!legalCols.length) return -1;
+
+                let bestCol = legalCols[0];
+                let bestScore = Number.NEGATIVE_INFINITY;
+                legalCols.forEach(col => {
+                    const moveScore = scoreDemoMove(sourceGrid, sourceConveyor, col, valToDrop);
+                    if (moveScore > bestScore) {
+                        bestScore = moveScore;
+                        bestCol = col;
+                    }
+                });
+                return bestCol;
+            };
+
+            const startDirectDrop = (colIndex) => {
+                const { mode, gameOver, guideOpen, animatingDrop, grid, queue } = stateRef.current;
+                if (mode !== 'direct' || gameOver || guideOpen || animatingDrop) return false;
+
+                const targetY = getLandingRowForColumn(grid, colIndex);
+                if (targetY === -1) return false;
+
+                const valToDrop = queue[0];
+                setAnimatingDrop({ x: colIndex, startY: -1, endY: targetY, val: valToDrop, isDropping: false });
+
+                requestAnimationFrame(() => {
+                    setAnimatingDrop(prev => prev ? { ...prev, isDropping: true } : prev);
+                });
+
+                clearTimeout(directDropCommitRef.current);
+                directDropCommitRef.current = setTimeout(() => {
                     lockTile(colIndex, targetY, valToDrop);
-                }
+                    setAnimatingDrop(null);
+                }, DIRECT_DROP_ANIM_MS);
+
+                return true;
+            };
+
+            // Interaction: Direct Drop
+            const handleColumnClick = (colIndex) => {
+                if (stateRef.current.demoMode) return;
+                startDirectDrop(colIndex);
             };
 
             // Interaction: Sliding
@@ -330,6 +404,22 @@
                 
                 return () => clearInterval(interval);
             }, [mode, gameOver, guideOpen]);
+
+            useEffect(() => {
+                if (!demoMode || gameOver || guideOpen || mode !== 'direct' || animatingDrop) return;
+
+                demoTimerRef.current = setTimeout(() => {
+                    const { grid, conveyor, queue } = stateRef.current;
+                    const chosenCol = chooseDemoColumn(grid, conveyor, queue[0]);
+                    if (chosenCol !== -1) startDirectDrop(chosenCol);
+                }, DEMO_THINK_MS);
+
+                return () => clearTimeout(demoTimerRef.current);
+            }, [demoMode, gameOver, guideOpen, mode, animatingDrop, grid, conveyor, queue]);
+
+            useEffect(() => {
+                if (gameOver) setDemoMode(false);
+            }, [gameOver]);
 
             const getRowSumFromGrid = (sourceGrid, rowIndex) => sourceGrid[rowIndex].reduce((sum, cell) => sum + (cell !== null ? cell : 0), 0);
 
@@ -465,11 +555,23 @@
                 setExplodingParticles([]);
                 setComboText('');
                 setAdvanceCount(0);
+                setAnimatingDrop(null);
+                clearTimeout(directDropCommitRef.current);
             };
 
             const toggleMode = () => {
+                if (demoMode) setDemoMode(false);
                 setMode(prev => prev === 'direct' ? 'sliding' : 'direct');
                 setActiveTile(null);
+            };
+
+            const toggleDemoMode = () => {
+                if (gameOver) return;
+                if (!demoMode) {
+                    setMode('direct');
+                    setActiveTile(null);
+                }
+                setDemoMode(prev => !prev);
             };
 
             const openGuide = () => setGuideOpen(true);
@@ -494,6 +596,8 @@
                 window.addEventListener('resize', updateUiScale);
                 window.addEventListener('orientationchange', updateUiScale);
                 return () => {
+                    clearTimeout(directDropCommitRef.current);
+                    clearTimeout(demoTimerRef.current);
                     window.removeEventListener('resize', updateUiScale);
                     window.removeEventListener('orientationchange', updateUiScale);
                 };
@@ -583,7 +687,7 @@
                                     {mode === 'direct' && Array.from({ length: COLS }).map((_, col) => (
                                         <div 
                                             key={`col-${col}`}
-                                            className="absolute w-14 col-hover-area cursor-pointer transition-colors z-10"
+                                            className={`absolute w-14 col-hover-area transition-colors z-10 ${demoMode || animatingDrop ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'}`}
                                             style={{ top: `${PAD}px`, bottom: `${PAD}px`, left: (col * CELL_SIZE) + PAD + 'px' }}
                                             onClick={() => handleColumnClick(col)}
                                         />
@@ -616,6 +720,20 @@
                                         </div>
                                     )}
 
+                                    {/* Direct Drop Animated Tile */}
+                                    {mode === 'direct' && animatingDrop && (
+                                        <div
+                                            className="absolute w-12 h-12 m-1 liquid-tile text-xl border-white/35 shadow-[0_0_18px_rgba(255,255,255,0.24)] z-20"
+                                            style={{
+                                                left: (animatingDrop.x * CELL_SIZE) + PAD + 'px',
+                                                top: ((animatingDrop.isDropping ? animatingDrop.endY : animatingDrop.startY) * CELL_SIZE) + PAD + 'px',
+                                                transition: `top ${DIRECT_DROP_ANIM_MS}ms cubic-bezier(0.2, 0.75, 0.3, 1)`
+                                            }}
+                                        >
+                                            {animatingDrop.val}
+                                        </div>
+                                    )}
+
                                     {/* Exploding Particles Layer */}
                                     {explodingParticles.map(p => (
                                         <div
@@ -636,7 +754,7 @@
                             </div>
 
                             {/* Mid: Row Sum Indicators */}
-                            <div className="flex flex-col justify-start px-1 sm:px-2"
+                            <div className="flex flex-col justify-start px-1 sm:px-2 w-[54px] sm:w-[58px] shrink-0"
                                 style={{
                                     height: (ROWS * CELL_SIZE) + (PAD * 2) + 'px',
                                     paddingTop: `${PAD}px`,
@@ -656,7 +774,7 @@
                                                     : 'text-white/35';
                                     return (
                                         <div key={`sum-${idx}`} className="flex items-center justify-center" style={{ height: `${CELL_SIZE}px` }}>
-                                            <span className={`text-sm sm:text-base tracking-tight transition-all duration-300 ${stateClass}`}>
+                                            <span className={`text-sm sm:text-base tracking-tight tabular-nums transition-all duration-300 ${stateClass}`}>
                                                 {hasTiles ? sum : ''}
                                             </span>
                                         </div>
@@ -726,6 +844,12 @@
                                     className="bg-white/10 hover:bg-white/20 border border-white/20 rounded-full px-4 sm:px-5 py-1.5 text-sm font-medium transition-colors text-white whitespace-nowrap"
                                 >
                                     {mode === 'direct' ? 'Direct Drop' : 'Sliding Placement'}
+                                </button>
+                                <button
+                                    onClick={toggleDemoMode}
+                                    className={`border rounded-full px-4 sm:px-5 py-1.5 text-sm font-medium transition-colors text-white whitespace-nowrap ${demoMode ? 'bg-emerald-300/20 border-emerald-200/45 shadow-[0_0_18px_rgba(80,255,160,0.22)]' : 'bg-white/5 hover:bg-white/15 border-white/15'}`}
+                                >
+                                    {demoMode ? 'Stop Demo' : 'Demo'}
                                 </button>
                                 <button
                                     onClick={openGuide}
