@@ -232,6 +232,15 @@
             foundationBreadthUnit: 34,
             foundationShelfBonus: 26,
             viableFoundationNearCompleteBonus: 74,
+            // Clear quality: prefer lower meaningful clears, but allow stronger cascades to override.
+            lowestClearBaseBonus: 220,
+            lowestClearDepthUnit: 420,
+            deadFloorClearDepthScale: 0.35,
+            weakFoundationLowClearBoost: 0.45,
+            cascadeExtraRowBonus: 260,
+            cascadeDepthBonus: 180,
+            cascadeBoardCleanupUnit: 40,
+            cascadeFoundationDeltaUnit: 320,
             deadRowClingPenalty: -95,
             deadRowInvestmentPenalty: -150,
             unsupportedUpperMassPenalty: -82,
@@ -716,6 +725,135 @@
                     if (rowSum === sourceConveyor[r]) matches.push(r);
                 }
                 return matches;
+            };
+
+            const getClearedRowsForMove = (sourceGrid, sourceConveyor) => (
+                findMatchingRows(sourceGrid, sourceConveyor)
+            );
+
+            const getLowestClearedRowIndex = (clearedRows) => (
+                clearedRows.length ? Math.max(...clearedRows) : -1
+            );
+
+            const collapseGridForClearedRows = (sourceGrid, clearedRows) => {
+                if (!clearedRows.length) return sourceGrid.map(row => [...row]);
+                const nextGrid = sourceGrid.filter((_, idx) => !clearedRows.includes(idx)).map(row => [...row]);
+                for (let i = 0; i < clearedRows.length; i++) nextGrid.unshift(Array(COLS).fill(null));
+                return nextGrid;
+            };
+
+            const getOccupiedCellCount = (sourceGrid) => sourceGrid.reduce((sum, row) => (
+                sum + row.reduce((rowSum, cell) => rowSum + (cell !== null ? 1 : 0), 0)
+            ), 0);
+
+            const getStrategicRowDepth = (rowIndex, activeFoundationStartRow) => {
+                if (rowIndex <= activeFoundationStartRow) return rowIndex;
+                // Rows below the active foundation are partially "dead floor": still relevant, but less strategic.
+                return activeFoundationStartRow + ((rowIndex - activeFoundationStartRow) * DEMO_WEIGHTS.deadFloorClearDepthScale);
+            };
+
+            const scoreLowestClearPreference = ({
+                clearedRows,
+                activeFoundationStartRow,
+                foundationQuality
+            }) => {
+                if (!clearedRows.length) return 0;
+                const lowestClearRow = getLowestClearedRowIndex(clearedRows);
+                if (lowestClearRow < 0) return 0;
+
+                const strategicDepth = getStrategicRowDepth(lowestClearRow, activeFoundationStartRow);
+                const normalizedDepth = strategicDepth / Math.max(1, ROWS - 1);
+                const weakFoundationBoost = 1 + (Math.max(0, 0.55 - foundationQuality) * DEMO_WEIGHTS.weakFoundationLowClearBoost);
+                return (DEMO_WEIGHTS.lowestClearBaseBonus + (normalizedDepth * DEMO_WEIGHTS.lowestClearDepthUnit)) * weakFoundationBoost;
+            };
+
+            const scoreClearCascadePotential = ({
+                gridAfterDrop,
+                sourceConveyor,
+                sourceIncomingTarget,
+                difficulty,
+                foundationBefore
+            }) => {
+                let workingGrid = gridAfterDrop.map(row => [...row]);
+                let totalRowsCleared = 0;
+                let cascadeDepth = 0;
+                let lowestClearedRow = -1;
+                let immediateClears = [];
+                const maxCascadeSteps = 3;
+
+                for (let step = 0; step < maxCascadeSteps; step++) {
+                    const clearedRows = getClearedRowsForMove(workingGrid, sourceConveyor);
+                    if (!clearedRows.length) break;
+
+                    if (step === 0) immediateClears = clearedRows;
+                    totalRowsCleared += clearedRows.length;
+                    cascadeDepth++;
+                    lowestClearedRow = Math.max(lowestClearedRow, getLowestClearedRowIndex(clearedRows));
+                    workingGrid = collapseGridForClearedRows(workingGrid, clearedRows);
+                }
+
+                if (totalRowsCleared === 0) {
+                    return {
+                        score: 0,
+                        totalRowsCleared: 0,
+                        immediateClearCount: 0,
+                        cascadeDepth: 0,
+                        lowestClearedRow: -1,
+                        postCascadeGrid: gridAfterDrop,
+                        foundationAfterCascadeQuality: foundationBefore.quality,
+                        activeFoundationStartRowAfterCascade: foundationBefore.activeFoundationStartRow
+                    };
+                }
+
+                const foundationAfter = scoreFoundationDevelopment({
+                    sourceGrid: workingGrid,
+                    sourceConveyor,
+                    sourceIncomingTarget,
+                    difficulty
+                });
+                const occupiedBefore = getOccupiedCellCount(gridAfterDrop);
+                const occupiedAfter = getOccupiedCellCount(workingGrid);
+                const cleanedCells = Math.max(0, occupiedBefore - occupiedAfter);
+                const extraRows = Math.max(0, totalRowsCleared - immediateClears.length);
+                const foundationDelta = foundationAfter.quality - foundationBefore.quality;
+
+                let score = 0;
+                score += extraRows * DEMO_WEIGHTS.cascadeExtraRowBonus;
+                score += Math.max(0, cascadeDepth - 1) * DEMO_WEIGHTS.cascadeDepthBonus;
+                score += cleanedCells * DEMO_WEIGHTS.cascadeBoardCleanupUnit;
+                if (foundationDelta > 0) score += foundationDelta * DEMO_WEIGHTS.cascadeFoundationDeltaUnit;
+
+                return {
+                    score,
+                    totalRowsCleared,
+                    immediateClearCount: immediateClears.length,
+                    cascadeDepth,
+                    lowestClearedRow,
+                    postCascadeGrid: workingGrid,
+                    foundationAfterCascadeQuality: foundationAfter.quality,
+                    activeFoundationStartRowAfterCascade: foundationAfter.activeFoundationStartRow
+                };
+            };
+
+            const compareClearQuality = ({
+                cascade,
+                activeFoundationStartRow,
+                foundationQuality
+            }) => {
+                if (!cascade || cascade.totalRowsCleared === 0) {
+                    return { score: 0, lowestClearScore: 0, cascadeScore: 0 };
+                }
+                const lowestClearScore = scoreLowestClearPreference({
+                    clearedRows: [cascade.lowestClearedRow],
+                    activeFoundationStartRow: cascade.activeFoundationStartRowAfterCascade ?? activeFoundationStartRow,
+                    foundationQuality: cascade.foundationAfterCascadeQuality ?? foundationQuality
+                });
+                const cascadeScore = cascade.score;
+                return {
+                    score: lowestClearScore + cascadeScore,
+                    lowestClearScore,
+                    cascadeScore
+                };
             };
 
             const requestResolveVisibleMatches = (gridOverride = null, conveyorOverride = null) => {
@@ -1320,6 +1458,18 @@
                     sourceIncomingTarget,
                     difficulty
                 });
+                const clearCascade = scoreClearCascadePotential({
+                    gridAfterDrop: nextGrid,
+                    sourceConveyor,
+                    sourceIncomingTarget,
+                    difficulty,
+                    foundationBefore: foundationAfter
+                });
+                const clearQuality = compareClearQuality({
+                    cascade: clearCascade,
+                    activeFoundationStartRow: foundationAfter.activeFoundationStartRow,
+                    foundationQuality: foundationAfter.quality
+                });
 
                 let tier1Score = 0;
                 let tier2Score = 0;
@@ -1383,6 +1533,8 @@
 
                 tier2Score += scoreBoardHealth(nextGrid, sourceConveyor, difficulty);
                 tier2Score += foundationAfter.score;
+                tier1Score += clearQuality.lowestClearScore;
+                tier2Score += clearQuality.cascadeScore;
 
                 // Structural support: punish top-heavy states and weak-floor towers.
                 tier1Score += scoreUnsupportedUpperMass({
@@ -1420,6 +1572,7 @@
                 // Soft priority boosts: strengthen strong strategic truths without brittle if/else rules.
                 const hasImmediateClear = afterLandingSum === landingTarget;
                 if (hasImmediateClear) tier1Score += DEMO_WEIGHTS.exactMatch * 0.45;
+                if (clearCascade.cascadeDepth >= 2) tier2Score += DEMO_WEIGHTS.cascadeDepthBonus * 0.4;
 
                 if (rowCapacitySignal > 0) tier1Score += rowCapacitySignal * 0.2;
                 if (landingForecastSignal > 0) tier2Score += landingForecastSignal * 0.25;
