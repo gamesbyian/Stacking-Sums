@@ -241,6 +241,8 @@
             const [conveyor, setConveyor] = useState(initialTargetState.current.conveyor);
             const [incomingTarget, setIncomingTarget] = useState(initialTargetState.current.incoming);
             const [conveyorAnim, setConveyorAnim] = useState(false);
+            const [conveyorAnimShift, setConveyorAnimShift] = useState(1);
+            const [conveyorAnimDuration, setConveyorAnimDuration] = useState(400);
             const [mode, setMode] = useState('direct');
             const [gameOver, setGameOver] = useState(false);
             const [score, setScore] = useState(0);
@@ -288,6 +290,68 @@
             };
 
             const getRowSumFromGrid = (sourceGrid, rowIndex) => sourceGrid[rowIndex].reduce((sum, cell) => sum + (cell !== null ? cell : 0), 0);
+
+            const rowHasTiles = (sourceGrid, rowIndex) => sourceGrid[rowIndex].some(cell => cell !== null);
+
+            const getConveyorValueAfterOneStep = (sourceConveyor, sourceIncomingTarget, rowIndex) => (
+                rowIndex === 0 ? sourceIncomingTarget : sourceConveyor[rowIndex - 1]
+            );
+
+            // Find a meaningful contiguous block (non-empty rows only) where all row sums match targetValue.
+            const findContiguousSameSumBlock = (sourceGrid, startRow, targetValue) => {
+                if (startRow < 0 || startRow >= ROWS) return null;
+                if (!rowHasTiles(sourceGrid, startRow)) return null;
+                if (getRowSumFromGrid(sourceGrid, startRow) !== targetValue) return null;
+
+                const prevRow = startRow - 1;
+                const previousIsSame = prevRow >= 0
+                    && rowHasTiles(sourceGrid, prevRow)
+                    && getRowSumFromGrid(sourceGrid, prevRow) === targetValue;
+                if (previousIsSame) return null; // Must be top-most row of the contiguous block.
+
+                let endRow = startRow;
+                while (endRow + 1 < ROWS) {
+                    const nextRow = endRow + 1;
+                    if (!rowHasTiles(sourceGrid, nextRow)) break;
+                    if (getRowSumFromGrid(sourceGrid, nextRow) !== targetValue) break;
+                    endRow = nextRow;
+                }
+
+                return {
+                    startRow,
+                    endRow,
+                    length: endRow - startRow + 1,
+                    sum: targetValue
+                };
+            };
+
+            // Determine if this conveyor event should overrun (skip ahead) past a same-sum adjacent block.
+            const getConveyorAdvanceDistance = (sourceGrid, sourceConveyor, sourceIncomingTarget) => {
+                for (let row = 0; row < ROWS; row++) {
+                    const wouldLandTarget = getConveyorValueAfterOneStep(sourceConveyor, sourceIncomingTarget, row);
+                    const block = findContiguousSameSumBlock(sourceGrid, row, wouldLandTarget);
+                    if (block && block.length >= 2) {
+                        return { distance: block.length, block };
+                    }
+                }
+                return { distance: 1, block: null };
+            };
+
+            const getConveyorAnimationDuration = (shiftCount) => (
+                shiftCount === 1
+                    ? 400
+                    : Math.min(760, 260 + (shiftCount * 120))
+            );
+
+            const buildConveyorAdvanceResult = (sourceConveyor, sourceIncomingTarget, shiftCount) => {
+                let nextConveyor = [...sourceConveyor];
+                let nextIncoming = sourceIncomingTarget;
+                for (let i = 0; i < shiftCount; i++) {
+                    nextConveyor = [nextIncoming, ...nextConveyor.slice(0, -1)];
+                    nextIncoming = generateTargetExcluding(nextConveyor[0]);
+                }
+                return { nextConveyor, nextIncoming };
+            };
 
             // Intended rule: a row clears when it has at least one tile and its sum
             // equals the row's currently visible conveyor target.
@@ -641,19 +705,23 @@
             // Conveyor movement: once the shift is visible, resolve matches against the now-visible targets.
             const evaluateRowsAndAdvance = () => {
                 const { grid, conveyor, incomingTarget, advanceCount } = stateRef.current;
+                const { distance: shiftCount } = getConveyorAdvanceDistance(grid, conveyor, incomingTarget);
+                const animDuration = getConveyorAnimationDuration(shiftCount);
 
+                setConveyorAnimShift(shiftCount);
+                setConveyorAnimDuration(animDuration);
                 setConveyorAnim(true);
 
                 setTimeout(() => {
-                    const newConveyor = [incomingTarget, ...conveyor.slice(0, -1)];
-                    const nextAdvanceCount = advanceCount + 1;
+                    const { nextConveyor: newConveyor, nextIncoming: newIncomingTarget } = buildConveyorAdvanceResult(conveyor, incomingTarget, shiftCount);
+                    const nextAdvanceCount = advanceCount + shiftCount;
 
                     setConveyorAnim(false);
                     setConveyor(newConveyor);
-                    setIncomingTarget(generateTargetExcluding(newConveyor[0]));
+                    setIncomingTarget(newIncomingTarget);
                     setAdvanceCount(nextAdvanceCount);
                     requestResolveVisibleMatches(grid, newConveyor);
-                }, 400); // Conveyor physical slide duration
+                }, animDuration); // Conveyor physical slide duration
             };
 
             const currentTickMs = getTickDuration(advanceCount);
@@ -693,6 +761,8 @@
                 setQueue([generateTile(), generateTile()]);
                 setGameOver(false);
                 setConveyorAnim(false);
+                setConveyorAnimShift(1);
+                setConveyorAnimDuration(400);
                 setScore(0);
                 setProgress(0);
                 setClearingRows([]);
@@ -949,8 +1019,8 @@
                                     <div
                                         className="relative w-full h-full"
                                         style={{
-                                            transform: conveyorAnim ? `translateY(${CELL_SIZE}px)` : 'translateY(0)',
-                                            transition: conveyorAnim ? 'transform 400ms cubic-bezier(0.4, 0, 0.2, 1)' : 'none'
+                                            transform: conveyorAnim ? `translateY(${CELL_SIZE * conveyorAnimShift}px)` : 'translateY(0)',
+                                            transition: conveyorAnim ? `transform ${conveyorAnimDuration}ms cubic-bezier(0.22, 1, 0.36, 1)` : 'none'
                                         }}
                                     >
                                         <div
