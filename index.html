@@ -158,27 +158,47 @@
         const DIRECT_DROP_ANIM_MS = 220;
         const DEMO_THINK_MS = 420;
         const DEMO_PAUSE_JITTER_MS = 180;
-        const DEMO_LOOKAHEAD_FACTOR = 0.35;
+        const DEMO_IMMEDIATE_FACTOR = 0.6;
+        const DEMO_LOOKAHEAD_FACTOR = 0.4;
         const CELL_SIZE = 56;
         const PAD = 8;
 
         const DEMO_WEIGHTS = {
-            exactMatch: 1800,
-            near1: 380,
-            near2: 220,
-            near3: 90,
-            improveGap: 60,
-            worsenGap: -90,
-            overshootUnit: -180,
-            overshootQuad: -26,
-            investedRowBonus: 75,
-            junkRowPenalty: -38,
+            // Clear priority (still the strongest axis).
+            exactMatch: 1450,
+            near1: 240,
+            near2: 110,
+            near3: 36,
+            improveGap: 26,
+            worsenGap: -68,
+            overshootUnit: -140,
+            overshootQuad: -22,
+            investedRowBonus: 52,
+            junkRowPenalty: -32,
+            activeRowBonus: 4,
+
+            // Flexibility, target-band and overcommitment controls.
+            mercyRowBonus: 28,
+            easyShapeRowBonus: 22,
+            hardRowPenalty: -18,
+            veryHighUnshapedPenalty: -28,
+            preserveMercyPenaltyPerTile: -18,
+            preserveMercyLargeTilePenalty: -16,
+            overcommitPenaltyUnit: -24,
+            flexibilityBandBonus: 26,
+            flexibleMixBonus: 34,
+            allHighRowsPenalty: -210,
+            emergencyRowsPenalty: -68,
+            rowSumSpreadPenalty: -4,
+            highClusterPenalty: -62,
+
+            // Height and stacking safety.
             landedTopDanger: -520,
-            heightBase: -28,
-            heightSquared: -18,
+            heightBase: -22,
+            heightSquared: -15,
             maxHeightDanger: -90,
-            skylineSpreadBonus: 18,
-            activeRowBonus: 8
+            skylineSpreadPenalty: -20,
+            heightSpikePenalty: -26
         };
 
         // Utility
@@ -526,6 +546,21 @@
                 return { nextGrid, landingRow, colIndex };
             };
 
+            const getRowBand = (sum) => {
+                if (sum <= 5) return 'mercy';
+                if (sum <= 12) return 'lowMid';
+                if (sum <= 20) return 'midHigh';
+                return 'veryHigh';
+            };
+
+            const getBandPreference = (difficulty) => ({
+                mercy: lerp(1.2, 0.7, difficulty),
+                lowMid: lerp(1.15, 0.85, difficulty),
+                midHigh: lerp(0.7, 1.1, difficulty),
+                veryHigh: lerp(0.35, 0.95, difficulty)
+            });
+
+            // Row-level proximity score: still rewards clears, but lowers greedy near-match dominance.
             const scoreRowProximity = (sum, target, hasTiles) => {
                 if (!hasTiles) return 0;
                 const gap = target - sum;
@@ -545,9 +580,89 @@
                 return score;
             };
 
-            const evaluateSimulatedMove = (sourceGrid, sourceConveyor, simulated) => {
+            // Reward rows that remain in reachable bands (mercy + easy-shaping).
+            const scoreFlexibilityBands = (rowSum, hasTiles, difficulty, rowGap) => {
+                if (!hasTiles) return 0;
+
+                const band = getRowBand(rowSum);
+                let score = 0;
+                if (band === 'mercy') score += DEMO_WEIGHTS.mercyRowBonus;
+                if (band === 'lowMid') score += DEMO_WEIGHTS.easyShapeRowBonus;
+                if (band === 'midHigh') score += DEMO_WEIGHTS.hardRowPenalty;
+                if (band === 'veryHigh') score += DEMO_WEIGHTS.veryHighUnshapedPenalty;
+
+                const pref = getBandPreference(difficulty);
+                score += (pref[band] || 0) * DEMO_WEIGHTS.flexibilityBandBonus;
+
+                // Very high rows are less concerning only when near completion.
+                if (rowSum > 20 && rowGap > 3) {
+                    score += DEMO_WEIGHTS.veryHighUnshapedPenalty;
+                }
+
+                return score;
+            };
+
+            // Penalize turning mercy rows into larger sums unless we are clearing now.
+            const scoreMercyPreservation = (beforeSum, afterSum, target, droppedValue) => {
+                if (beforeSum > 5 || afterSum === target) return 0;
+                if (afterSum <= 5) return DEMO_WEIGHTS.mercyRowBonus * 0.75;
+                const growth = afterSum - beforeSum;
+                let penalty = growth * DEMO_WEIGHTS.preserveMercyPenaltyPerTile;
+                if (droppedValue >= 6) penalty += DEMO_WEIGHTS.preserveMercyLargeTilePenalty;
+                return penalty;
+            };
+
+            // Board-level health: prefer mixed low+mid rows and avoid all-hard configurations.
+            const scoreBoardHealth = (sourceGrid, sourceConveyor, difficulty) => {
+                const rowSums = [];
+                let mercyCount = 0;
+                let lowMidCount = 0;
+                let hardCount = 0;
+                let emergencyCount = 0;
+                let highClusterCount = 0;
+                let prevHigh = false;
+
+                for (let row = 0; row < ROWS; row++) {
+                    if (!rowHasTiles(sourceGrid, row)) continue;
+                    const sum = getRowSumFromGrid(sourceGrid, row);
+                    const gap = Math.abs(sourceConveyor[row] - sum);
+                    rowSums.push(sum);
+                    if (sum <= 5) mercyCount++;
+                    else if (sum <= 12) lowMidCount++;
+                    if (sum >= 13) hardCount++;
+                    if (sum >= 20 && gap > 4) emergencyCount++;
+
+                    const isHigh = sum >= 13;
+                    if (isHigh && prevHigh) highClusterCount++;
+                    prevHigh = isHigh;
+                }
+
+                if (!rowSums.length) return 0;
+
+                let score = 0;
+                const healthyMix = Math.min(mercyCount, 2) + Math.min(lowMidCount, 3);
+                score += healthyMix * DEMO_WEIGHTS.flexibleMixBonus;
+
+                const safeHardBudget = Math.round(lerp(2, 5, difficulty));
+                if (hardCount > safeHardBudget) {
+                    score += (hardCount - safeHardBudget) * DEMO_WEIGHTS.overcommitPenaltyUnit;
+                }
+
+                if (hardCount >= rowSums.length - 1) score += DEMO_WEIGHTS.allHighRowsPenalty;
+                score += emergencyCount * DEMO_WEIGHTS.emergencyRowsPenalty;
+                score += highClusterCount * DEMO_WEIGHTS.highClusterPenalty;
+
+                const minSum = Math.min(...rowSums);
+                const maxSum = Math.max(...rowSums);
+                score += (maxSum - minSum) * DEMO_WEIGHTS.rowSumSpreadPenalty;
+
+                return score;
+            };
+
+            const evaluateSimulatedMove = (sourceGrid, sourceConveyor, simulated, scoreValue) => {
                 if (!simulated) return Number.NEGATIVE_INFINITY;
                 const { nextGrid, landingRow, colIndex } = simulated;
+                const difficulty = getDifficulty(scoreValue || 0);
 
                 let score = 0;
                 const landingTarget = sourceConveyor[landingRow];
@@ -561,14 +676,20 @@
                 score += (beforeGap - afterGap) * DEMO_WEIGHTS.improveGap;
                 if (afterGap > beforeGap) score += DEMO_WEIGHTS.worsenGap;
                 if (landingHadTiles && afterGap <= beforeGap) score += DEMO_WEIGHTS.investedRowBonus;
+                score += scoreFlexibilityBands(afterLandingSum, true, difficulty, afterGap);
+                score += scoreMercyPreservation(beforeLandingSum, afterLandingSum, landingTarget, sourceGrid[landingRow][colIndex] === null ? nextGrid[landingRow][colIndex] : 0);
 
                 for (let row = 0; row < ROWS; row++) {
                     if (row === landingRow) continue;
                     const rowHasTiles = nextGrid[row].some(cell => cell !== null);
                     const rowSum = getRowSumFromGrid(nextGrid, row);
-                    score += scoreRowProximity(rowSum, sourceConveyor[row], rowHasTiles) * 0.24;
+                    const rowGap = Math.abs(sourceConveyor[row] - rowSum);
+                    score += scoreRowProximity(rowSum, sourceConveyor[row], rowHasTiles) * 0.2;
+                    score += scoreFlexibilityBands(rowSum, rowHasTiles, difficulty, rowGap) * 0.75;
                     if (rowHasTiles) score += DEMO_WEIGHTS.activeRowBonus;
                 }
+
+                score += scoreBoardHealth(nextGrid, sourceConveyor, difficulty);
 
                 const heights = getColumnHeights(nextGrid);
                 const maxHeight = Math.max(...heights);
@@ -579,7 +700,10 @@
                 });
 
                 score += maxHeight * DEMO_WEIGHTS.maxHeightDanger;
-                score += (maxHeight - minHeight) * DEMO_WEIGHTS.skylineSpreadBonus;
+                score += (maxHeight - minHeight) * DEMO_WEIGHTS.skylineSpreadPenalty;
+                for (let col = 1; col < COLS; col++) {
+                    score += Math.abs(heights[col] - heights[col - 1]) * DEMO_WEIGHTS.heightSpikePenalty;
+                }
 
                 const topDanger = landingRow <= 2 ? (3 - landingRow) : 0;
                 if (topDanger > 0) score += topDanger * DEMO_WEIGHTS.landedTopDanger;
@@ -590,7 +714,7 @@
                 return score;
             };
 
-            const chooseDemoColumn = (sourceGrid, sourceConveyor, currentTile, nextTile) => {
+            const chooseDemoColumn = (sourceGrid, sourceConveyor, currentTile, nextTile, scoreValue) => {
                 const legalCols = getLegalDirectDropColumns(sourceGrid);
                 if (!legalCols.length) return { col: -1, score: Number.NEGATIVE_INFINITY };
 
@@ -598,15 +722,15 @@
                 let bestScore = Number.NEGATIVE_INFINITY;
                 legalCols.forEach(col => {
                     const currentSim = simulateDirectDropResult(sourceGrid, col, currentTile);
-                    const currentScore = evaluateSimulatedMove(sourceGrid, sourceConveyor, currentSim);
+                    const currentScore = evaluateSimulatedMove(sourceGrid, sourceConveyor, currentSim, scoreValue);
 
-                    let combinedScore = currentScore;
+                    let combinedScore = currentScore * DEMO_IMMEDIATE_FACTOR;
                     if (nextTile !== undefined && nextTile !== null && currentSim) {
                         const nextLegalCols = getLegalDirectDropColumns(currentSim.nextGrid);
                         let nextBest = Number.NEGATIVE_INFINITY;
                         nextLegalCols.forEach(nextCol => {
                             const nextSim = simulateDirectDropResult(currentSim.nextGrid, nextCol, nextTile);
-                            const nextScore = evaluateSimulatedMove(currentSim.nextGrid, sourceConveyor, nextSim);
+                            const nextScore = evaluateSimulatedMove(currentSim.nextGrid, sourceConveyor, nextSim, scoreValue);
                             if (nextScore > nextBest) nextBest = nextScore;
                         });
                         if (nextBest !== Number.NEGATIVE_INFINITY) combinedScore += nextBest * DEMO_LOOKAHEAD_FACTOR;
@@ -702,8 +826,8 @@
                 if (!demoMode || gameOver || guideOpen || mode !== 'direct' || animatingDrop || conveyorAnim || clearingRows.length > 0 || explodingParticles.length > 0) return;
 
                 demoTimerRef.current = setTimeout(() => {
-                    const { grid, conveyor, queue } = stateRef.current;
-                    const choice = chooseDemoColumn(grid, conveyor, queue[0], queue[1]);
+                    const { grid, conveyor, queue, score } = stateRef.current;
+                    const choice = chooseDemoColumn(grid, conveyor, queue[0], queue[1], score);
                     if (choice.col !== -1) startDirectDrop(choice.col);
                 }, DEMO_THINK_MS + randomInt(0, DEMO_PAUSE_JITTER_MS));
 
