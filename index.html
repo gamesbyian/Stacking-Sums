@@ -75,7 +75,25 @@
             font-weight: 700;
             color: #ffffff;
             text-shadow: 0 2px 6px rgba(0,0,0,0.8);
-            transition: transform 0.1s ease, top 0.2s ease, left 0.2s ease;
+            transition: transform 120ms ease-out, opacity 140ms ease-out;
+        }
+
+        .liquid-tile-fast {
+            background: rgba(14, 20, 30, 0.9);
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            box-shadow: 0 4px 10px rgba(0,0,0,0.32), inset 0 1px 2px rgba(255,255,255,0.06);
+            border-radius: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            color: #ffffff;
+            text-shadow: 0 2px 6px rgba(0,0,0,0.8);
+            transition: transform 120ms ease-out, opacity 140ms ease-out;
+        }
+
+        .tile-animating {
+            will-change: transform;
         }
 
         .target-tile {
@@ -101,7 +119,6 @@
 
         /* Progress ring */
         .progress-ring__circle {
-            transition: stroke-dashoffset 0.1s linear;
             transform: rotate(-90deg);
             transform-origin: 50% 50%;
         }
@@ -145,7 +162,7 @@
     <div id="root"></div>
 
     <script type="text/babel">
-        const { useState, useEffect, useRef, useCallback } = React;
+        const { useState, useEffect, useRef, useCallback, useMemo } = React;
 
         // Constants
         const ROWS = 12;
@@ -153,7 +170,6 @@
         const MAX_TICK_MS = 15000;
         const MIN_TICK_MS = 10000;
         const TICK_RAMP_ADVANCES = 20;
-        const PROGRESS_INTERVAL_MS = 50;
         const FALL_SPEED_MS = 800;
         const DIRECT_DROP_ANIM_MS = 220;
         const TARGET_ROW_COUNT = 50;
@@ -376,6 +392,72 @@
         };
         const isAllClear = (sourceGrid) => sourceGrid.every((row) => row.every((cell) => cell === null));
 
+        const ProgressRing = React.memo(({ durationMs, running, cycleNonce }) => {
+            const circleRef = useRef(null);
+            const secondsRef = useRef(null);
+            const rafRef = useRef(null);
+            const durationRef = useRef(durationMs);
+            const CIRCUMFERENCE = 125.66;
+
+            useEffect(() => {
+                durationRef.current = durationMs;
+            }, [durationMs]);
+
+            useEffect(() => {
+                if (!circleRef.current || !secondsRef.current) return undefined;
+
+                const circle = circleRef.current;
+                const seconds = secondsRef.current;
+                const startTime = performance.now();
+                let lastShownSecond = null;
+
+                const paint = (now) => {
+                    const elapsed = now - startTime;
+                    const duration = Math.max(durationRef.current, 1);
+                    const progress = Math.min(elapsed / duration, 1);
+                    circle.style.strokeDashoffset = String(CIRCUMFERENCE - (progress * CIRCUMFERENCE));
+                    const secondsLeft = Math.max(0, Math.ceil((duration - elapsed) / 1000));
+                    if (secondsLeft !== lastShownSecond) {
+                        seconds.textContent = `${secondsLeft}s`;
+                        lastShownSecond = secondsLeft;
+                    }
+                    if (progress < 1 && running) {
+                        rafRef.current = requestAnimationFrame(paint);
+                    }
+                };
+
+                circle.style.strokeDashoffset = '0';
+                seconds.textContent = `${Math.ceil(durationRef.current / 1000)}s`;
+                if (running) {
+                    rafRef.current = requestAnimationFrame(paint);
+                }
+
+                return () => {
+                    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+                    rafRef.current = null;
+                };
+            }, [running, cycleNonce]);
+
+            return (
+                <div className="relative w-12 h-12 flex items-center justify-center">
+                    <svg width="48" height="48" className="rotate-90">
+                        <circle cx="24" cy="24" r="20" fill="transparent" stroke="rgba(255,255,255,0.05)" strokeWidth="4" />
+                        <circle
+                            ref={circleRef}
+                            cx="24" cy="24" r="20"
+                            fill="transparent"
+                            stroke="rgba(255,255,255,0.8)"
+                            strokeWidth="4"
+                            strokeDasharray={CIRCUMFERENCE}
+                            strokeDashoffset="0"
+                            className="progress-ring__circle drop-shadow-md"
+                        />
+                    </svg>
+                    <div ref={secondsRef} className="absolute font-bold text-xs text-white" />
+                </div>
+            );
+        });
+
         const App = () => {
             const initialTargetState = useRef((() => {
                 const conveyor = createConveyorTargets();
@@ -400,7 +482,7 @@
             const [demoMode, setDemoMode] = useState(false);
 
             // Timing & FX state
-            const [progress, setProgress] = useState(0);
+            const [tickCycle, setTickCycle] = useState(0);
             const [clearingRows, setClearingRows] = useState([]);
             const [explodingParticles, setExplodingParticles] = useState([]);
             const [comboText, setComboText] = useState('');
@@ -1622,10 +1704,11 @@
                 if (targetY === -1) return false;
 
                 const valToDrop = queue[0];
-                setAnimatingDrop({ x: colIndex, startY: -1, endY: targetY, val: valToDrop, isDropping: false });
+                const startOffsetPx = (-1 - targetY) * CELL_SIZE;
+                setAnimatingDrop({ x: colIndex, endY: targetY, val: valToDrop, transformY: startOffsetPx });
 
                 requestAnimationFrame(() => {
-                    setAnimatingDrop(prev => prev ? { ...prev, isDropping: true } : prev);
+                    setAnimatingDrop(prev => prev ? { ...prev, transformY: 0 } : prev);
                 });
 
                 clearTimeout(directDropCommitRef.current);
@@ -1708,12 +1791,6 @@
                 if (gameOver) setDemoMode(false);
             }, [gameOver]);
 
-            const getRowDelta = (rowIndex, targetValue = conveyor[rowIndex]) => {
-                const sum = getRowSumFromGrid(grid, rowIndex);
-                const hasTiles = grid[rowIndex].some(cell => cell !== null);
-                return { sum, hasTiles, difference: Math.abs(targetValue - sum) };
-            };
-
             const getTickDuration = (advances) => {
                 const t = Math.min(advances / TICK_RAMP_ADVANCES, 1);
                 return Math.round(MAX_TICK_MS - (MAX_TICK_MS - MIN_TICK_MS) * t);
@@ -1751,25 +1828,12 @@
 
             useEffect(() => {
                 if (gameOver || guideOpen) return;
-
-                let elapsedTime = (progress / 100) * currentTickMs;
-
-                const tick = () => {
-                    elapsedTime += PROGRESS_INTERVAL_MS;
-                    const percentage = Math.min((elapsedTime / currentTickMs) * 100, 100);
-
-                    if (elapsedTime >= currentTickMs) {
-                        evaluateRowsAndAdvance();
-                        elapsedTime = 0;
-                        setProgress(0);
-                    } else {
-                        setProgress(percentage);
-                    }
-                };
-
-                tickTimerRef.current = setInterval(tick, PROGRESS_INTERVAL_MS);
-                return () => clearInterval(tickTimerRef.current);
-            }, [gameOver, guideOpen, currentTickMs]);
+                tickTimerRef.current = setTimeout(() => {
+                    setTickCycle((prev) => prev + 1);
+                    evaluateRowsAndAdvance();
+                }, currentTickMs);
+                return () => clearTimeout(tickTimerRef.current);
+            }, [gameOver, guideOpen, currentTickMs, tickCycle]);
 
             const resetGameState = ({ nextDemoMode = false, nextMode = stateRef.current.mode } = {}) => {
                 clearTimeout(directDropCommitRef.current);
@@ -1787,7 +1851,7 @@
                 setConveyorAnimShift(1);
                 setConveyorAnimDuration(400);
                 setScore(0);
-                setProgress(0);
+                setTickCycle(0);
                 setClearingRows([]);
                 setExplodingParticles([]);
                 setComboText('');
@@ -1823,8 +1887,6 @@
 
             const openGuide = () => setGuideOpen(true);
 
-            const getRowSum = (rowIndex) => getRowSumFromGrid(grid, rowIndex);
-
             const updateUiScale = useCallback(() => {
                 const frame = frameRef.current;
                 if (!frame) return;
@@ -1843,12 +1905,49 @@
                 window.addEventListener('resize', updateUiScale);
                 window.addEventListener('orientationchange', updateUiScale);
                 return () => {
+                    clearTimeout(tickTimerRef.current);
                     clearTimeout(directDropCommitRef.current);
                     clearTimeout(demoTimerRef.current);
                     window.removeEventListener('resize', updateUiScale);
                     window.removeEventListener('orientationchange', updateUiScale);
                 };
             }, [updateUiScale]);
+
+            const gridGuideCells = useMemo(
+                () => Array.from({ length: ROWS * COLS }, (_, i) => (
+                    <div key={`guide-${i}`} className="border-[0.5px] border-white/5 w-14 h-14 box-border"></div>
+                )),
+                []
+            );
+
+            const directColumns = useMemo(() => Array.from({ length: COLS }, (_, col) => col), []);
+            const boardTiles = useMemo(
+                () => grid.map((row, y) =>
+                    row.map((cell, x) => {
+                        if (cell === null) return null;
+                        const isClearing = clearingRows.includes(y);
+                        return (
+                            <div
+                                key={`cell-${x}-${y}`}
+                                className={`absolute w-12 h-12 m-1 liquid-tile text-xl ${isClearing ? 'vibrating-row' : ''}`}
+                                style={{ left: (x * CELL_SIZE) + PAD + 'px', top: (y * CELL_SIZE) + PAD + 'px' }}
+                            >
+                                {cell}
+                            </div>
+                        );
+                    })
+                ),
+                [grid, clearingRows]
+            );
+
+            const rowDeltaMeta = useMemo(
+                () => conveyor.map((target, idx) => {
+                    const sum = getRowSumFromGrid(grid, idx);
+                    const hasTiles = grid[idx].some(c => c !== null);
+                    return { idx, target, sum, hasTiles, difference: Math.abs(target - sum) };
+                }),
+                [conveyor, grid]
+            );
 
             return (
                 <div className="w-screen h-[100svh] flex flex-col items-center justify-center p-2 sm:p-4 overflow-hidden">
@@ -1891,23 +1990,7 @@
                             <div className="liquid-panel px-8 py-3 flex flex-col items-center justify-center min-w-[120px]">
                                 <div className="flex flex-col items-center">
                                     <div className="text-[10px] uppercase tracking-widest opacity-60 mb-2 font-bold text-white">Conveyor</div>
-                                    <div className="relative w-12 h-12 flex items-center justify-center">
-                                        <svg width="48" height="48" className="rotate-90">
-                                            <circle cx="24" cy="24" r="20" fill="transparent" stroke="rgba(255,255,255,0.05)" strokeWidth="4" />
-                                            <circle
-                                                cx="24" cy="24" r="20"
-                                                fill="transparent"
-                                                stroke="rgba(255,255,255,0.8)"
-                                                strokeWidth="4"
-                                                strokeDasharray="125.66"
-                                                strokeDashoffset={125.66 - (progress / 100) * 125.66}
-                                                className="progress-ring__circle drop-shadow-md"
-                                            />
-                                        </svg>
-                                        <div className="absolute font-bold text-xs text-white">
-                                            {Math.ceil((currentTickMs - (progress / 100 * currentTickMs)) / 1000)}s
-                                        </div>
-                                    </div>
+                                    <ProgressRing durationMs={currentTickMs} running={!gameOver && !guideOpen} cycleNonce={tickCycle} />
                                 </div>
                             </div>
                         </div>
@@ -1929,12 +2012,10 @@
                                         }}
                                     >
                                     {/* Grid guides */}
-                                    {Array.from({ length: ROWS * COLS }).map((_, i) => (
-                                        <div key={i} className="border-[0.5px] border-white/5 w-14 h-14 box-border"></div>
-                                    ))}
+                                    {gridGuideCells}
 
                                     {/* Column Interactors */}
-                                    {mode === 'direct' && Array.from({ length: COLS }).map((_, col) => (
+                                    {mode === 'direct' && directColumns.map((col) => (
                                         <div
                                             key={`col-${col}`}
                                             className={`absolute w-14 col-hover-area transition-colors z-10 ${demoMode || animatingDrop ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'}`}
@@ -1944,26 +2025,12 @@
                                     ))}
 
                                     {/* Static/Vibrating Grid Tiles */}
-                                    {grid.map((row, y) =>
-                                        row.map((cell, x) => {
-                                            if (cell === null) return null;
-                                            const isClearing = clearingRows.includes(y);
-                                            return (
-                                                <div
-                                                    key={`cell-${x}-${y}`}
-                                                    className={`absolute w-12 h-12 m-1 liquid-tile text-xl ${isClearing ? 'vibrating-row' : ''}`}
-                                                    style={{ left: (x * CELL_SIZE) + PAD + 'px', top: (y * CELL_SIZE) + PAD + 'px' }}
-                                                >
-                                                    {cell}
-                                                </div>
-                                            );
-                                        })
-                                    )}
+                                    {boardTiles}
 
                                     {/* Player Active Tile (Sliding Mode) */}
                                     {mode === 'sliding' && activeTile && (
                                         <div
-                                            className="absolute w-12 h-12 m-1 liquid-tile text-xl border-white/40 shadow-[0_0_20px_rgba(255,255,255,0.3)] z-20"
+                                            className="absolute w-12 h-12 m-1 liquid-tile-fast text-xl border-white/40 shadow-[0_0_14px_rgba(255,255,255,0.2)] z-20"
                                             style={{ left: (activeTile.x * CELL_SIZE) + PAD + 'px', top: (activeTile.y * CELL_SIZE) + PAD + 'px' }}
                                         >
                                             {activeTile.val}
@@ -1973,11 +2040,12 @@
                                     {/* Direct Drop Animated Tile */}
                                     {mode === 'direct' && animatingDrop && (
                                         <div
-                                            className="absolute w-12 h-12 m-1 liquid-tile text-xl border-white/35 shadow-[0_0_18px_rgba(255,255,255,0.24)] z-20"
+                                            className="absolute w-12 h-12 m-1 liquid-tile-fast tile-animating text-xl border-white/35 shadow-[0_0_14px_rgba(255,255,255,0.2)] z-20"
                                             style={{
                                                 left: (animatingDrop.x * CELL_SIZE) + PAD + 'px',
-                                                top: ((animatingDrop.isDropping ? animatingDrop.endY : animatingDrop.startY) * CELL_SIZE) + PAD + 'px',
-                                                transition: `top ${DIRECT_DROP_ANIM_MS}ms cubic-bezier(0.2, 0.75, 0.3, 1)`
+                                                top: (animatingDrop.endY * CELL_SIZE) + PAD + 'px',
+                                                transform: `translate3d(0, ${animatingDrop.transformY}px, 0)`,
+                                                transition: `transform ${DIRECT_DROP_ANIM_MS}ms cubic-bezier(0.2, 0.75, 0.3, 1)`
                                             }}
                                         >
                                             {animatingDrop.val}
@@ -1988,7 +2056,7 @@
                                     {explodingParticles.map(p => (
                                         <div
                                             key={p.id}
-                                            className="absolute w-12 h-12 m-1 liquid-tile text-xl particle"
+                                            className="absolute w-12 h-12 m-1 liquid-tile-fast tile-animating text-xl particle"
                                             style={{
                                                 left: (p.x * CELL_SIZE) + PAD + 'px',
                                                 top: (p.y * CELL_SIZE) + PAD + 'px',
@@ -2011,8 +2079,7 @@
                                             paddingBottom: `${PAD}px`
                                         }}
                                     >
-                                        {conveyor.map((target, idx) => {
-                                            const { sum, hasTiles, difference } = getRowDelta(idx, target);
+                                        {rowDeltaMeta.map(({ idx, sum, hasTiles, difference }) => {
                                             const stateClass = !hasTiles
                                                 ? 'text-white/15'
                                                 : difference === 0
@@ -2024,7 +2091,7 @@
                                                             : 'text-white/35';
                                             return (
                                                 <div key={`sum-${idx}`} className="h-full flex items-center justify-center" style={{ height: `${CELL_SIZE}px` }}>
-                                                    <span className={`text-sm sm:text-base leading-none tracking-tight tabular-nums min-w-[2ch] text-center transition-all duration-300 ${stateClass}`}>
+                                                    <span className={`text-sm sm:text-base leading-none tracking-tight tabular-nums min-w-[2ch] text-center transition-colors duration-300 ${stateClass}`}>
                                                         {hasTiles ? sum : ''}
                                                     </span>
                                                 </div>
@@ -2057,9 +2124,7 @@
                                             </div>
                                         </div>
 
-                                        {conveyor.map((target, idx) => {
-                                            const sum = getRowSum(idx);
-                                            const hasTiles = grid[idx].some(c => c !== null);
+                                        {rowDeltaMeta.map(({ idx, target, sum, hasTiles }) => {
                                             // Keeps the matched style locked while conveyorAnim is false.
                                             // When vibrating happens, conveyorAnim is false, so it stays lit.
                                             const isMatch = !conveyorAnim && hasTiles && sum === target;
@@ -2070,7 +2135,7 @@
                                                     className="absolute w-full flex items-center justify-center z-10"
                                                     style={{ height: `${CELL_SIZE}px`, top: `${idx * CELL_SIZE}px` }}
                                                 >
-                                                    <div className={`w-12 h-12 rounded-xl flex items-center justify-center transition-all duration-300 ${isMatch ? 'target-matched' : 'target-tile'}`}>
+                                                    <div className={`w-12 h-12 rounded-xl flex items-center justify-center transition-colors duration-300 ${isMatch ? 'target-matched' : 'target-tile'}`}>
                                                         <span>{target}</span>
                                                     </div>
                                                 </div>
