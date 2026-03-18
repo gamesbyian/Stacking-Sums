@@ -156,6 +156,10 @@
         const PROGRESS_INTERVAL_MS = 50;
         const FALL_SPEED_MS = 800;
         const DIRECT_DROP_ANIM_MS = 220;
+        const TARGET_ROW_COUNT = 50;
+        const TARGET_RAMP_SOFTENING = 0.5;
+        const SERIES_BONUS_POINTS = 1000;
+        const ALL_CLEAR_BONUS_POINTS = 500;
         const DEMO_THINK_MS = 420;
         const DEMO_PAUSE_JITTER_MS = 180;
         const DEMO_IMMEDIATE_FACTOR = 0.6;
@@ -227,14 +231,38 @@
             { value: 9, weight: 3 }
         ]);
 
-        const getDifficulty = (scoreValue) => Math.min(scoreValue / 6000, 1);
-        const getTargetWeights = (difficulty) => ({
-            low: lerp(0.15, 0.04, difficulty),
-            lowMid: lerp(0.40, 0.24, difficulty),
-            mid: lerp(0.28, 0.34, difficulty),
-            high: lerp(0.12, 0.24, difficulty),
-            veryHigh: lerp(0.05, 0.14, difficulty)
-        });
+        const getDifficulty = (rowsClearedTotal) => Math.min(rowsClearedTotal / TARGET_ROW_COUNT, 1);
+        const softenLateWeight = (earlyWeight, lateWeight) => earlyWeight + ((lateWeight - earlyWeight) * TARGET_RAMP_SOFTENING);
+        const getTargetWeights = (difficulty) => {
+            const earlyWeights = {
+                low: 0.15,
+                lowMid: 0.40,
+                mid: 0.28,
+                high: 0.12,
+                veryHigh: 0.05
+            };
+            const lateWeights = {
+                low: 0.04,
+                lowMid: 0.24,
+                mid: 0.34,
+                high: 0.24,
+                veryHigh: 0.14
+            };
+            const softenedLateWeights = Object.fromEntries(
+                Object.keys(earlyWeights).map((key) => [
+                    key,
+                    softenLateWeight(earlyWeights[key], lateWeights[key])
+                ])
+            );
+
+            return {
+                low: lerp(earlyWeights.low, softenedLateWeights.low, difficulty),
+                lowMid: lerp(earlyWeights.lowMid, softenedLateWeights.lowMid, difficulty),
+                mid: lerp(earlyWeights.mid, softenedLateWeights.mid, difficulty),
+                high: lerp(earlyWeights.high, softenedLateWeights.high, difficulty),
+                veryHigh: lerp(earlyWeights.veryHigh, softenedLateWeights.veryHigh, difficulty)
+            };
+        };
         const normalizeBucketWeights = (weights) => {
             const total = Object.values(weights).reduce((sum, weight) => sum + weight, 0);
             if (total <= 0) return weights;
@@ -248,8 +276,8 @@
             veryHigh: [25, 28]
         };
 
-        const generateTarget = (scoreValue = 0) => {
-            const difficulty = getDifficulty(scoreValue);
+        const generateTarget = (rowsClearedTotal = 0) => {
+            const difficulty = getDifficulty(rowsClearedTotal);
             const weights = normalizeBucketWeights(getTargetWeights(difficulty));
             const selectedBucket = weightedPick([
                 { value: 'low', weight: weights.low },
@@ -261,21 +289,38 @@
             const [min, max] = targetBuckets[selectedBucket];
             return randomInt(min, max);
         };
-        const generateTargetExcluding = (excludedValue, scoreValue = 0) => {
-            let nextTarget = generateTarget(scoreValue);
+        const generateTargetExcluding = (excludedValue, rowsClearedTotal = 0) => {
+            let nextTarget = generateTarget(rowsClearedTotal);
             while (nextTarget === excludedValue) {
-                nextTarget = generateTarget(scoreValue);
+                nextTarget = generateTarget(rowsClearedTotal);
             }
             return nextTarget;
         };
-        const createConveyorTargets = (scoreValue = 0) => {
+        const createConveyorTargets = (rowsClearedTotal = 0) => {
             const targets = [];
             for (let i = 0; i < ROWS; i++) {
-                targets.push(generateTargetExcluding(i > 0 ? targets[i - 1] : null, scoreValue));
+                targets.push(generateTargetExcluding(i > 0 ? targets[i - 1] : null, rowsClearedTotal));
             }
             return targets;
         };
         const createEmptyGrid = () => Array.from({ length: ROWS }, () => Array(COLS).fill(null));
+        const triangularSeriesByTarget = {
+            3: [1, 2],
+            6: [1, 2, 3],
+            10: [1, 2, 3, 4],
+            15: [1, 2, 3, 4, 5],
+            21: [1, 2, 3, 4, 5, 6],
+            28: [1, 2, 3, 4, 5, 6, 7]
+        };
+        const qualifiesForSeriesBonus = (rowValues, target) => {
+            const requiredSeries = triangularSeriesByTarget[target];
+            if (!requiredSeries) return false;
+
+            // Ignore empty cells/nulls and allow zeros as filler.
+            const presentValues = new Set(rowValues.filter((value) => value !== null && value !== 0));
+            return requiredSeries.every((requiredValue) => presentValues.has(requiredValue));
+        };
+        const isAllClear = (sourceGrid) => sourceGrid.every((row) => row.every((cell) => cell === null));
 
         const App = () => {
             const initialTargetState = useRef((() => {
@@ -295,6 +340,7 @@
             const [mode, setMode] = useState('direct');
             const [gameOver, setGameOver] = useState(false);
             const [score, setScore] = useState(0);
+            const [rowsClearedTotal, setRowsClearedTotal] = useState(0);
             const [guideOpen, setGuideOpen] = useState(true);
             const [animatingDrop, setAnimatingDrop] = useState(null);
             const [demoMode, setDemoMode] = useState(false);
@@ -308,17 +354,18 @@
             const [advanceCount, setAdvanceCount] = useState(0);
 
             // Refs
-            const stateRef = useRef({ grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount, animatingDrop, demoMode, conveyorAnim, clearingRows, explodingParticles, score });
+            const stateRef = useRef({ grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount, animatingDrop, demoMode, conveyorAnim, clearingRows, explodingParticles, score, rowsClearedTotal });
             const tickTimerRef = useRef(null);
             const frameRef = useRef(null);
             const directDropCommitRef = useRef(null);
             const demoTimerRef = useRef(null);
             const resolvePendingRef = useRef(false);
             const resolvingRowsRef = useRef(false);
+            const allClearAwardedOnEmptyRef = useRef(false);
 
             useEffect(() => {
-                stateRef.current = { grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount, animatingDrop, demoMode, conveyorAnim, clearingRows, explodingParticles, score };
-            }, [grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount, animatingDrop, demoMode, conveyorAnim, clearingRows, explodingParticles, score]);
+                stateRef.current = { grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount, animatingDrop, demoMode, conveyorAnim, clearingRows, explodingParticles, score, rowsClearedTotal };
+            }, [grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount, animatingDrop, demoMode, conveyorAnim, clearingRows, explodingParticles, score, rowsClearedTotal]);
 
             useEffect(() => {
                 if (!conveyorAnim && resolvePendingRef.current) {
@@ -392,12 +439,12 @@
                     : Math.min(760, 260 + (shiftCount * 120))
             );
 
-            const buildConveyorAdvanceResult = (sourceConveyor, sourceIncomingTarget, shiftCount, scoreValue) => {
+            const buildConveyorAdvanceResult = (sourceConveyor, sourceIncomingTarget, shiftCount, rowsClearedCount) => {
                 let nextConveyor = [...sourceConveyor];
                 let nextIncoming = sourceIncomingTarget;
                 for (let i = 0; i < shiftCount; i++) {
                     nextConveyor = [nextIncoming, ...nextConveyor.slice(0, -1)];
-                    nextIncoming = generateTargetExcluding(nextConveyor[0], scoreValue);
+                    nextIncoming = generateTargetExcluding(nextConveyor[0], rowsClearedCount);
                 }
                 return { nextConveyor, nextIncoming };
             };
@@ -437,12 +484,26 @@
                 resolvePendingRef.current = false;
                 setClearingRows(matchingRows);
 
+                // Evaluate bonuses from pre-clear row content.
+                const seriesBonusCount = matchingRows.reduce((count, rowIndex) => (
+                    qualifiesForSeriesBonus(workingGrid[rowIndex], workingConveyor[rowIndex]) ? count + 1 : count
+                ), 0);
                 const cascadeScore = getCascadeScore(matchingRows.length);
-                setScore(s => s + cascadeScore);
+                const seriesBonusScore = seriesBonusCount * SERIES_BONUS_POINTS;
+                const clearEventScore = cascadeScore + seriesBonusScore;
+                setScore((s) => s + clearEventScore);
+                setRowsClearedTotal((rows) => rows + matchingRows.length);
 
+                const clearMessages = [];
                 if (matchingRows.length > 1) {
                     const comboLabel = matchingRows.length === 2 ? 'DOUBLE CLEAR' : matchingRows.length === 3 ? 'TRIPLE CLEAR' : `CASCADE x${matchingRows.length}`;
-                    setComboText(`${comboLabel} +${cascadeScore}`);
+                    clearMessages.push(`${comboLabel} +${cascadeScore}`);
+                }
+                if (seriesBonusCount > 0) {
+                    clearMessages.push(`SERIES +${seriesBonusScore}`);
+                }
+                if (clearMessages.length > 0) {
+                    setComboText(clearMessages.join(' • '));
                     setTimeout(() => setComboText(''), 1200);
                 }
 
@@ -468,6 +529,17 @@
                     for (let i = 0; i < matchingRows.length; i++) {
                         collapsedGrid.unshift(Array(COLS).fill(null));
                     }
+                    const boardIsEmpty = isAllClear(collapsedGrid);
+                    if (boardIsEmpty) {
+                        if (!allClearAwardedOnEmptyRef.current) {
+                            setScore((s) => s + ALL_CLEAR_BONUS_POINTS);
+                            setComboText(`ALL CLEAR +${ALL_CLEAR_BONUS_POINTS}`);
+                            setTimeout(() => setComboText(''), 1200);
+                            allClearAwardedOnEmptyRef.current = true;
+                        }
+                    } else {
+                        allClearAwardedOnEmptyRef.current = false;
+                    }
                     setGrid(collapsedGrid);
                     setClearingRows([]);
 
@@ -482,6 +554,7 @@
             const lockTile = (x, y, val) => {
                 const newGrid = stateRef.current.grid.map(row => [...row]);
                 newGrid[y][x] = val;
+                allClearAwardedOnEmptyRef.current = false;
                 setGrid(newGrid);
                 requestResolveVisibleMatches(newGrid, stateRef.current.conveyor);
 
@@ -659,10 +732,10 @@
                 return score;
             };
 
-            const evaluateSimulatedMove = (sourceGrid, sourceConveyor, simulated, scoreValue) => {
+            const evaluateSimulatedMove = (sourceGrid, sourceConveyor, simulated, rowsClearedCount) => {
                 if (!simulated) return Number.NEGATIVE_INFINITY;
                 const { nextGrid, landingRow, colIndex } = simulated;
-                const difficulty = getDifficulty(scoreValue || 0);
+                const difficulty = getDifficulty(rowsClearedCount || 0);
 
                 let score = 0;
                 const landingTarget = sourceConveyor[landingRow];
@@ -714,7 +787,7 @@
                 return score;
             };
 
-            const chooseDemoColumn = (sourceGrid, sourceConveyor, currentTile, nextTile, scoreValue) => {
+            const chooseDemoColumn = (sourceGrid, sourceConveyor, currentTile, nextTile, rowsClearedCount) => {
                 const legalCols = getLegalDirectDropColumns(sourceGrid);
                 if (!legalCols.length) return { col: -1, score: Number.NEGATIVE_INFINITY };
 
@@ -722,7 +795,7 @@
                 let bestScore = Number.NEGATIVE_INFINITY;
                 legalCols.forEach(col => {
                     const currentSim = simulateDirectDropResult(sourceGrid, col, currentTile);
-                    const currentScore = evaluateSimulatedMove(sourceGrid, sourceConveyor, currentSim, scoreValue);
+                    const currentScore = evaluateSimulatedMove(sourceGrid, sourceConveyor, currentSim, rowsClearedCount);
 
                     let combinedScore = currentScore * DEMO_IMMEDIATE_FACTOR;
                     if (nextTile !== undefined && nextTile !== null && currentSim) {
@@ -730,7 +803,7 @@
                         let nextBest = Number.NEGATIVE_INFINITY;
                         nextLegalCols.forEach(nextCol => {
                             const nextSim = simulateDirectDropResult(currentSim.nextGrid, nextCol, nextTile);
-                            const nextScore = evaluateSimulatedMove(currentSim.nextGrid, sourceConveyor, nextSim, scoreValue);
+                            const nextScore = evaluateSimulatedMove(currentSim.nextGrid, sourceConveyor, nextSim, rowsClearedCount);
                             if (nextScore > nextBest) nextBest = nextScore;
                         });
                         if (nextBest !== Number.NEGATIVE_INFINITY) combinedScore += nextBest * DEMO_LOOKAHEAD_FACTOR;
@@ -826,8 +899,8 @@
                 if (!demoMode || gameOver || guideOpen || mode !== 'direct' || animatingDrop || conveyorAnim || clearingRows.length > 0 || explodingParticles.length > 0) return;
 
                 demoTimerRef.current = setTimeout(() => {
-                    const { grid, conveyor, queue, score } = stateRef.current;
-                    const choice = chooseDemoColumn(grid, conveyor, queue[0], queue[1], score);
+                    const { grid, conveyor, queue, rowsClearedTotal } = stateRef.current;
+                    const choice = chooseDemoColumn(grid, conveyor, queue[0], queue[1], rowsClearedTotal);
                     if (choice.col !== -1) startDirectDrop(choice.col);
                 }, DEMO_THINK_MS + randomInt(0, DEMO_PAUSE_JITTER_MS));
 
@@ -857,7 +930,7 @@
 
             // Conveyor movement: once the shift is visible, resolve matches against the now-visible targets.
             const evaluateRowsAndAdvance = () => {
-                const { grid, conveyor, incomingTarget, advanceCount, score } = stateRef.current;
+                const { grid, conveyor, incomingTarget, advanceCount, rowsClearedTotal } = stateRef.current;
                 const { distance: shiftCount } = getConveyorAdvanceDistance(grid, conveyor, incomingTarget);
                 const animDuration = getConveyorAnimationDuration(shiftCount);
 
@@ -866,7 +939,7 @@
                 setConveyorAnim(true);
 
                 setTimeout(() => {
-                    const { nextConveyor: newConveyor, nextIncoming: newIncomingTarget } = buildConveyorAdvanceResult(conveyor, incomingTarget, shiftCount, score);
+                    const { nextConveyor: newConveyor, nextIncoming: newIncomingTarget } = buildConveyorAdvanceResult(conveyor, incomingTarget, shiftCount, rowsClearedTotal);
                     const nextAdvanceCount = advanceCount + shiftCount;
 
                     setConveyorAnim(false);
@@ -922,9 +995,11 @@
                 setExplodingParticles([]);
                 setComboText('');
                 setAdvanceCount(0);
+                setRowsClearedTotal(0);
                 setAnimatingDrop(null);
                 setMode(nextMode);
                 setDemoMode(nextDemoMode);
+                allClearAwardedOnEmptyRef.current = false;
             };
 
             const restart = () => {
