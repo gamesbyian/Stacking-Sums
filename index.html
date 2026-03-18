@@ -212,6 +212,12 @@
             reservedRowRuinPenalty: -1080,
             preserveReservedRowBonus: 840,
             preserveTwoSlotNearRowBonus: 115,
+            forecastAdvance1Bonus: 210,
+            forecastAdvance2Bonus: 145,
+            forecastAdvance3Bonus: 95,
+            forecastWaitabilityFailPenalty: -18,
+            forecastRoomyWaitBonus: 20,
+            forecastCrampedWaitPenalty: -24,
 
             // Height and stacking safety.
             landedTopDanger: -520,
@@ -474,6 +480,128 @@
                     nextIncoming = generateTargetExcluding(nextConveyor[0], rowsClearedCount);
                 }
                 return { nextConveyor, nextIncoming };
+            };
+
+            // For demo forecasting we only trust concrete, currently visible targets:
+            // the conveyor itself plus the current incoming target above it.
+            const buildKnownTargetPool = (sourceConveyor, sourceIncomingTarget) => (
+                [...sourceConveyor, sourceIncomingTarget]
+            );
+
+            const advanceConveyorForecastState = (sourceGrid, forecastState) => {
+                if (!forecastState || forecastState.knownDepleted) {
+                    return { ...forecastState, knownDepleted: true };
+                }
+
+                const shiftInfo = getConveyorAdvanceDistance(sourceGrid, forecastState.conveyor, forecastState.incomingTarget);
+                const shiftCount = shiftInfo.distance;
+                let nextConveyor = [...forecastState.conveyor];
+                let poolIndex = forecastState.poolIndex;
+                let incoming = forecastState.incomingTarget;
+
+                for (let i = 0; i < shiftCount; i++) {
+                    if (incoming === null || incoming === undefined) {
+                        return { ...forecastState, knownDepleted: true };
+                    }
+                    nextConveyor = [incoming, ...nextConveyor.slice(0, -1)];
+                    poolIndex += 1;
+                    incoming = poolIndex < forecastState.knownPool.length ? forecastState.knownPool[poolIndex] : null;
+                }
+
+                return {
+                    conveyor: nextConveyor,
+                    incomingTarget: incoming,
+                    knownPool: forecastState.knownPool,
+                    poolIndex,
+                    knownDepleted: false
+                };
+            };
+
+            const getTargetForRowAfterAdvances = (sourceGrid, sourceConveyor, sourceIncomingTarget, rowIndex, advanceCount) => {
+                if (advanceCount <= 0) return sourceConveyor[rowIndex];
+                let forecastState = {
+                    conveyor: [...sourceConveyor],
+                    incomingTarget: sourceIncomingTarget,
+                    knownPool: buildKnownTargetPool(sourceConveyor, sourceIncomingTarget),
+                    poolIndex: sourceConveyor.length,
+                    knownDepleted: false
+                };
+
+                for (let step = 0; step < advanceCount; step++) {
+                    forecastState = advanceConveyorForecastState(sourceGrid, forecastState);
+                    if (forecastState.knownDepleted) return null;
+                }
+                return forecastState.conveyor[rowIndex];
+            };
+
+            const getUpcomingTargetsForRow = (sourceGrid, sourceConveyor, sourceIncomingTarget, rowIndex, maxAdvances = 3) => {
+                const upcoming = [];
+                for (let advancesAway = 1; advancesAway <= maxAdvances; advancesAway++) {
+                    const target = getTargetForRowAfterAdvances(
+                        sourceGrid,
+                        sourceConveyor,
+                        sourceIncomingTarget,
+                        rowIndex,
+                        advancesAway
+                    );
+                    upcoming.push({ advancesAway, target });
+                    if (target === null || target === undefined) break;
+                }
+                return upcoming;
+            };
+
+            const rowCanReasonablyWaitForTarget = (sourceGrid, rowIndex, rowSum, target, advancesAway) => {
+                if (target === null || target === undefined || rowSum !== target) {
+                    return { canWait: false, stability: 0 };
+                }
+
+                const emptyCount = getRowEmptyCount(sourceGrid, rowIndex);
+                if (emptyCount === 0) return { canWait: false, stability: 0 };
+
+                let stability = emptyCount >= 3 ? 1 : emptyCount === 2 ? 0.76 : 0.42;
+                if (advancesAway === 2 && emptyCount === 1) stability *= 0.72;
+                if (advancesAway >= 3 && emptyCount <= 1) stability *= 0.58;
+
+                if (rowSum >= 25 && emptyCount <= 1) stability *= 0.52;
+                if (rowSum <= 5 && advancesAway >= 3) stability *= 0.84;
+
+                return { canWait: stability >= 0.33, stability };
+            };
+
+            const getConveyorForecastBonus = ({
+                sourceGrid,
+                sourceConveyor,
+                sourceIncomingTarget,
+                rowIndex,
+                rowSum
+            }) => {
+                if (!rowHasTiles(sourceGrid, rowIndex)) return 0;
+
+                const upcoming = getUpcomingTargetsForRow(sourceGrid, sourceConveyor, sourceIncomingTarget, rowIndex, 3);
+                let bonus = 0;
+
+                for (const { advancesAway, target } of upcoming) {
+                    if (target === null || target === undefined || target !== rowSum) continue;
+
+                    const wait = rowCanReasonablyWaitForTarget(sourceGrid, rowIndex, rowSum, target, advancesAway);
+                    const base = advancesAway === 1
+                        ? DEMO_WEIGHTS.forecastAdvance1Bonus
+                        : advancesAway === 2
+                            ? DEMO_WEIGHTS.forecastAdvance2Bonus
+                            : DEMO_WEIGHTS.forecastAdvance3Bonus;
+
+                    if (wait.canWait) {
+                        bonus += base * wait.stability;
+                        const emptyCount = getRowEmptyCount(sourceGrid, rowIndex);
+                        if (emptyCount >= 3) bonus += DEMO_WEIGHTS.forecastRoomyWaitBonus;
+                        if (emptyCount === 1 && advancesAway >= 2) bonus += DEMO_WEIGHTS.forecastCrampedWaitPenalty;
+                    } else {
+                        bonus += DEMO_WEIGHTS.forecastWaitabilityFailPenalty;
+                    }
+                    break; // Use nearest concrete upcoming match only.
+                }
+
+                return bonus;
             };
 
             // Intended rule: a row clears when it has at least one tile and its sum
@@ -888,7 +1016,7 @@
                 return score;
             };
 
-            const evaluateSimulatedMove = (sourceGrid, sourceConveyor, simulated, rowsClearedCount, currentTile, nextTile) => {
+            const evaluateSimulatedMove = (sourceGrid, sourceConveyor, sourceIncomingTarget, simulated, rowsClearedCount, currentTile, nextTile) => {
                 if (!simulated) return Number.NEGATIVE_INFINITY;
                 const { nextGrid, landingRow, colIndex } = simulated;
                 const difficulty = getDifficulty(rowsClearedCount || 0);
@@ -918,6 +1046,13 @@
                     currentTile: currentTile !== undefined && currentTile !== null ? currentTile : droppedValue,
                     nextTile
                 });
+                score += getConveyorForecastBonus({
+                    sourceGrid: nextGrid,
+                    sourceConveyor,
+                    sourceIncomingTarget,
+                    rowIndex: landingRow,
+                    rowSum: afterLandingSum
+                });
 
                 // Encourage healthy intentional build-up above current target when row is still shapeable.
                 if (landingGapSigned < 0) {
@@ -936,6 +1071,13 @@
                     const rowEmptyCount = getRowEmptyCount(nextGrid, row);
                     score += scoreRowProximity(rowSum, sourceConveyor[row], rowHasTiles, nextGrid, row) * 0.2;
                     score += scoreFlexibilityBands(rowSum, rowHasTiles, difficulty, rowGap, rowEmptyCount) * 0.75;
+                    score += getConveyorForecastBonus({
+                        sourceGrid: nextGrid,
+                        sourceConveyor,
+                        sourceIncomingTarget,
+                        rowIndex: row,
+                        rowSum
+                    }) * 0.55;
                     if (rowHasTiles) score += DEMO_WEIGHTS.activeRowBonus;
                 }
 
@@ -964,7 +1106,7 @@
                 return score;
             };
 
-            const chooseDemoColumn = (sourceGrid, sourceConveyor, currentTile, nextTile, rowsClearedCount) => {
+            const chooseDemoColumn = (sourceGrid, sourceConveyor, sourceIncomingTarget, currentTile, nextTile, rowsClearedCount) => {
                 const legalCols = getLegalDirectDropColumns(sourceGrid);
                 if (!legalCols.length) return { col: -1, score: Number.NEGATIVE_INFINITY };
 
@@ -972,7 +1114,7 @@
                 let bestScore = Number.NEGATIVE_INFINITY;
                 legalCols.forEach(col => {
                     const currentSim = simulateDirectDropResult(sourceGrid, col, currentTile);
-                    const currentScore = evaluateSimulatedMove(sourceGrid, sourceConveyor, currentSim, rowsClearedCount, currentTile, nextTile);
+                    const currentScore = evaluateSimulatedMove(sourceGrid, sourceConveyor, sourceIncomingTarget, currentSim, rowsClearedCount, currentTile, nextTile);
 
                     let combinedScore = currentScore * DEMO_IMMEDIATE_FACTOR;
                     if (nextTile !== undefined && nextTile !== null && currentSim) {
@@ -980,7 +1122,7 @@
                         let nextBest = Number.NEGATIVE_INFINITY;
                         nextLegalCols.forEach(nextCol => {
                             const nextSim = simulateDirectDropResult(currentSim.nextGrid, nextCol, nextTile);
-                            const nextScore = evaluateSimulatedMove(currentSim.nextGrid, sourceConveyor, nextSim, rowsClearedCount, nextTile, null);
+                            const nextScore = evaluateSimulatedMove(currentSim.nextGrid, sourceConveyor, sourceIncomingTarget, nextSim, rowsClearedCount, nextTile, null);
                             if (nextScore > nextBest) nextBest = nextScore;
                         });
                         if (nextBest !== Number.NEGATIVE_INFINITY) combinedScore += nextBest * DEMO_LOOKAHEAD_FACTOR;
@@ -1076,8 +1218,8 @@
                 if (!demoMode || gameOver || guideOpen || mode !== 'direct' || animatingDrop || conveyorAnim || clearingRows.length > 0 || explodingParticles.length > 0) return;
 
                 demoTimerRef.current = setTimeout(() => {
-                    const { grid, conveyor, queue, rowsClearedTotal } = stateRef.current;
-                    const choice = chooseDemoColumn(grid, conveyor, queue[0], queue[1], rowsClearedTotal);
+                    const { grid, conveyor, incomingTarget, queue, rowsClearedTotal } = stateRef.current;
+                    const choice = chooseDemoColumn(grid, conveyor, incomingTarget, queue[0], queue[1], rowsClearedTotal);
                     if (choice.col !== -1) startDirectDrop(choice.col);
                 }, DEMO_THINK_MS + randomInt(0, DEMO_PAUSE_JITTER_MS));
 
