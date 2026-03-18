@@ -196,6 +196,14 @@
             rowSumSpreadPenalty: -4,
             highClusterPenalty: -62,
 
+            // Tactical row-capacity awareness (protect fragile last-slot opportunities).
+            lastSlotWasteBasePenalty: -640,
+            lastSlotNearTargetUnitPenalty: -120,
+            lastSlotFlexibleBandPenalty: -130,
+            reservedRowRuinPenalty: -1080,
+            preserveReservedRowBonus: 840,
+            preserveTwoSlotNearRowBonus: 115,
+
             // Height and stacking safety.
             landedTopDanger: -520,
             heightBase: -22,
@@ -388,6 +396,16 @@
             const getRowSumFromGrid = (sourceGrid, rowIndex) => sourceGrid[rowIndex].reduce((sum, cell) => sum + (cell !== null ? cell : 0), 0);
 
             const rowHasTiles = (sourceGrid, rowIndex) => sourceGrid[rowIndex].some(cell => cell !== null);
+            const getRowFilledCount = (sourceGrid, rowIndex) => sourceGrid[rowIndex].reduce((count, cell) => count + (cell !== null ? 1 : 0), 0);
+            const getRowEmptyCount = (sourceGrid, rowIndex) => COLS - getRowFilledCount(sourceGrid, rowIndex);
+            const getRowGapToTarget = (rowSum, target) => target - rowSum;
+            const isLastSlotMove = (sourceGrid, rowIndex) => getRowEmptyCount(sourceGrid, rowIndex) === 1;
+            const nextTileExactlyFitsRow = (rowSum, target, nextTile) => (
+                nextTile !== undefined && nextTile !== null && (rowSum + nextTile) === target
+            );
+            const currentTileExactlyFitsRow = (rowSum, target, currentTile) => (
+                currentTile !== undefined && currentTile !== null && (rowSum + currentTile) === target
+            );
 
             const getConveyorValueAfterOneStep = (sourceConveyor, sourceIncomingTarget, rowIndex) => (
                 rowIndex === 0 ? sourceIncomingTarget : sourceConveyor[rowIndex - 1]
@@ -732,10 +750,87 @@
                 return score;
             };
 
-            const evaluateSimulatedMove = (sourceGrid, sourceConveyor, simulated, rowsClearedCount) => {
+            const getReservedRowData = (sourceGrid, sourceConveyor, nextTile) => {
+                const reservedRows = [];
+                const nearTwoSlotRows = [];
+
+                for (let row = 0; row < ROWS; row++) {
+                    if (!rowHasTiles(sourceGrid, row)) continue;
+                    const rowSum = getRowSumFromGrid(sourceGrid, row);
+                    const gap = getRowGapToTarget(rowSum, sourceConveyor[row]);
+                    const emptyCount = getRowEmptyCount(sourceGrid, row);
+                    const band = getRowBand(rowSum);
+                    const flexibleBand = band === 'mercy' || band === 'lowMid';
+                    const isNearTarget = gap > 0 && gap <= 3;
+
+                    if (emptyCount === 1 && nextTileExactlyFitsRow(rowSum, sourceConveyor[row], nextTile)) {
+                        reservedRows.push({ row, gap, flexibleBand });
+                    } else if (emptyCount === 2 && isNearTarget && flexibleBand) {
+                        nearTwoSlotRows.push(row);
+                    }
+                }
+
+                return { reservedRows, nearTwoSlotRows };
+            };
+
+            const scoreRowCapacityTactics = ({ sourceGrid, sourceConveyor, landingRow, afterLandingSum, currentTile, nextTile }) => {
+                const rowTarget = sourceConveyor[landingRow];
+                const beforeSum = getRowSumFromGrid(sourceGrid, landingRow);
+                const beforeGap = Math.abs(getRowGapToTarget(beforeSum, rowTarget));
+                const clearsRow = afterLandingSum === rowTarget;
+                const { reservedRows, nearTwoSlotRows } = getReservedRowData(sourceGrid, sourceConveyor, nextTile);
+                const reservedRowIds = new Set(reservedRows.map(entry => entry.row));
+
+                let score = 0;
+
+                // Strong penalty: do not consume a fragile last slot unless it actually clears.
+                if (isLastSlotMove(sourceGrid, landingRow) && !clearsRow) {
+                    score += DEMO_WEIGHTS.lastSlotWasteBasePenalty;
+                    if (beforeGap <= 3) {
+                        score += (4 - beforeGap) * DEMO_WEIGHTS.lastSlotNearTargetUnitPenalty;
+                    }
+
+                    const band = getRowBand(beforeSum);
+                    if (band === 'mercy' || band === 'lowMid') {
+                        score += DEMO_WEIGHTS.lastSlotFlexibleBandPenalty;
+                    }
+
+                    // Very strong tactical penalty: if next tile is exact-fit, avoid ruining the setup.
+                    if (nextTileExactlyFitsRow(beforeSum, rowTarget, nextTile)) {
+                        score += DEMO_WEIGHTS.reservedRowRuinPenalty;
+                    }
+                }
+
+                // Slightly weaker treatment for two-slot tactical rows that are close and flexible.
+                nearTwoSlotRows.forEach(row => {
+                    if (row !== landingRow) score += DEMO_WEIGHTS.preserveTwoSlotNearRowBonus;
+                });
+
+                // Reward preserving one-gap reserved rows for an exact next-tile clear.
+                reservedRows.forEach(({ row, flexibleBand }) => {
+                    if (row !== landingRow) {
+                        score += DEMO_WEIGHTS.preserveReservedRowBonus;
+                    } else if (clearsRow && currentTileExactlyFitsRow(beforeSum, rowTarget, currentTile)) {
+                        // If we clear immediately with current tile, this is also tactically sound.
+                        score += DEMO_WEIGHTS.preserveReservedRowBonus * 0.35;
+                    } else if (flexibleBand) {
+                        score += DEMO_WEIGHTS.lastSlotFlexibleBandPenalty * 0.5;
+                    }
+                });
+
+                // Tiny nudge to avoid disturbing a row that is tactically reserved by lookahead.
+                if (reservedRowIds.size > 0 && landingRow !== -1 && !reservedRowIds.has(landingRow)) {
+                    score += 18;
+                }
+
+                return score;
+            };
+
+            const evaluateSimulatedMove = (sourceGrid, sourceConveyor, simulated, rowsClearedCount, currentTile, nextTile) => {
                 if (!simulated) return Number.NEGATIVE_INFINITY;
                 const { nextGrid, landingRow, colIndex } = simulated;
                 const difficulty = getDifficulty(rowsClearedCount || 0);
+                const droppedValue = nextGrid[landingRow][colIndex];
 
                 let score = 0;
                 const landingTarget = sourceConveyor[landingRow];
@@ -750,7 +845,15 @@
                 if (afterGap > beforeGap) score += DEMO_WEIGHTS.worsenGap;
                 if (landingHadTiles && afterGap <= beforeGap) score += DEMO_WEIGHTS.investedRowBonus;
                 score += scoreFlexibilityBands(afterLandingSum, true, difficulty, afterGap);
-                score += scoreMercyPreservation(beforeLandingSum, afterLandingSum, landingTarget, sourceGrid[landingRow][colIndex] === null ? nextGrid[landingRow][colIndex] : 0);
+                score += scoreMercyPreservation(beforeLandingSum, afterLandingSum, landingTarget, droppedValue);
+                score += scoreRowCapacityTactics({
+                    sourceGrid,
+                    sourceConveyor,
+                    landingRow,
+                    afterLandingSum,
+                    currentTile: currentTile !== undefined && currentTile !== null ? currentTile : droppedValue,
+                    nextTile
+                });
 
                 for (let row = 0; row < ROWS; row++) {
                     if (row === landingRow) continue;
@@ -795,7 +898,7 @@
                 let bestScore = Number.NEGATIVE_INFINITY;
                 legalCols.forEach(col => {
                     const currentSim = simulateDirectDropResult(sourceGrid, col, currentTile);
-                    const currentScore = evaluateSimulatedMove(sourceGrid, sourceConveyor, currentSim, rowsClearedCount);
+                    const currentScore = evaluateSimulatedMove(sourceGrid, sourceConveyor, currentSim, rowsClearedCount, currentTile, nextTile);
 
                     let combinedScore = currentScore * DEMO_IMMEDIATE_FACTOR;
                     if (nextTile !== undefined && nextTile !== null && currentSim) {
@@ -803,7 +906,7 @@
                         let nextBest = Number.NEGATIVE_INFINITY;
                         nextLegalCols.forEach(nextCol => {
                             const nextSim = simulateDirectDropResult(currentSim.nextGrid, nextCol, nextTile);
-                            const nextScore = evaluateSimulatedMove(currentSim.nextGrid, sourceConveyor, nextSim, rowsClearedCount);
+                            const nextScore = evaluateSimulatedMove(currentSim.nextGrid, sourceConveyor, nextSim, rowsClearedCount, nextTile, null);
                             if (nextScore > nextBest) nextBest = nextScore;
                         });
                         if (nextBest !== Number.NEGATIVE_INFINITY) combinedScore += nextBest * DEMO_LOOKAHEAD_FACTOR;
