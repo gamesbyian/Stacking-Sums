@@ -183,6 +183,7 @@
 
         // Utility
         const randomInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+        const lerp = (a, b, t) => a + (b - a) * t;
         const weightedPick = (weightedValues) => {
             const totalWeight = weightedValues.reduce((sum, entry) => sum + entry.weight, 0);
             let roll = Math.random() * totalWeight;
@@ -205,24 +206,52 @@
             { value: 8, weight: 4 },
             { value: 9, weight: 3 }
         ]);
-        // Center targets in a humane mid-range while still allowing occasional high totals.
-        const generateTarget = () => weightedPick([
-            { value: randomInt(6, 10), weight: 5 },
-            { value: randomInt(11, 16), weight: 11 },
-            { value: randomInt(17, 22), weight: 8 },
-            { value: randomInt(23, 28), weight: 4 }
-        ]);
-        const generateTargetExcluding = (excludedValue) => {
-            let nextTarget = generateTarget();
+
+        const getDifficulty = (scoreValue) => Math.min(scoreValue / 6000, 1);
+        const getTargetWeights = (difficulty) => ({
+            low: lerp(0.15, 0.04, difficulty),
+            lowMid: lerp(0.40, 0.24, difficulty),
+            mid: lerp(0.28, 0.34, difficulty),
+            high: lerp(0.12, 0.24, difficulty),
+            veryHigh: lerp(0.05, 0.14, difficulty)
+        });
+        const normalizeBucketWeights = (weights) => {
+            const total = Object.values(weights).reduce((sum, weight) => sum + weight, 0);
+            if (total <= 0) return weights;
+            return Object.fromEntries(Object.entries(weights).map(([key, value]) => [key, value / total]));
+        };
+        const targetBuckets = {
+            low: [1, 5],
+            lowMid: [6, 12],
+            mid: [13, 18],
+            high: [19, 24],
+            veryHigh: [25, 28]
+        };
+
+        const generateTarget = (scoreValue = 0) => {
+            const difficulty = getDifficulty(scoreValue);
+            const weights = normalizeBucketWeights(getTargetWeights(difficulty));
+            const selectedBucket = weightedPick([
+                { value: 'low', weight: weights.low },
+                { value: 'lowMid', weight: weights.lowMid },
+                { value: 'mid', weight: weights.mid },
+                { value: 'high', weight: weights.high },
+                { value: 'veryHigh', weight: weights.veryHigh }
+            ]);
+            const [min, max] = targetBuckets[selectedBucket];
+            return randomInt(min, max);
+        };
+        const generateTargetExcluding = (excludedValue, scoreValue = 0) => {
+            let nextTarget = generateTarget(scoreValue);
             while (nextTarget === excludedValue) {
-                nextTarget = generateTarget();
+                nextTarget = generateTarget(scoreValue);
             }
             return nextTarget;
         };
-        const createConveyorTargets = () => {
+        const createConveyorTargets = (scoreValue = 0) => {
             const targets = [];
             for (let i = 0; i < ROWS; i++) {
-                targets.push(generateTargetExcluding(i > 0 ? targets[i - 1] : null));
+                targets.push(generateTargetExcluding(i > 0 ? targets[i - 1] : null, scoreValue));
             }
             return targets;
         };
@@ -259,7 +288,7 @@
             const [advanceCount, setAdvanceCount] = useState(0);
 
             // Refs
-            const stateRef = useRef({ grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount, animatingDrop, demoMode, conveyorAnim, clearingRows, explodingParticles });
+            const stateRef = useRef({ grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount, animatingDrop, demoMode, conveyorAnim, clearingRows, explodingParticles, score });
             const tickTimerRef = useRef(null);
             const frameRef = useRef(null);
             const directDropCommitRef = useRef(null);
@@ -268,8 +297,8 @@
             const resolvingRowsRef = useRef(false);
 
             useEffect(() => {
-                stateRef.current = { grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount, animatingDrop, demoMode, conveyorAnim, clearingRows, explodingParticles };
-            }, [grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount, animatingDrop, demoMode, conveyorAnim, clearingRows, explodingParticles]);
+                stateRef.current = { grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount, animatingDrop, demoMode, conveyorAnim, clearingRows, explodingParticles, score };
+            }, [grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount, animatingDrop, demoMode, conveyorAnim, clearingRows, explodingParticles, score]);
 
             useEffect(() => {
                 if (!conveyorAnim && resolvePendingRef.current) {
@@ -343,12 +372,12 @@
                     : Math.min(760, 260 + (shiftCount * 120))
             );
 
-            const buildConveyorAdvanceResult = (sourceConveyor, sourceIncomingTarget, shiftCount) => {
+            const buildConveyorAdvanceResult = (sourceConveyor, sourceIncomingTarget, shiftCount, scoreValue) => {
                 let nextConveyor = [...sourceConveyor];
                 let nextIncoming = sourceIncomingTarget;
                 for (let i = 0; i < shiftCount; i++) {
                     nextConveyor = [nextIncoming, ...nextConveyor.slice(0, -1)];
-                    nextIncoming = generateTargetExcluding(nextConveyor[0]);
+                    nextIncoming = generateTargetExcluding(nextConveyor[0], scoreValue);
                 }
                 return { nextConveyor, nextIncoming };
             };
@@ -704,7 +733,7 @@
 
             // Conveyor movement: once the shift is visible, resolve matches against the now-visible targets.
             const evaluateRowsAndAdvance = () => {
-                const { grid, conveyor, incomingTarget, advanceCount } = stateRef.current;
+                const { grid, conveyor, incomingTarget, advanceCount, score } = stateRef.current;
                 const { distance: shiftCount } = getConveyorAdvanceDistance(grid, conveyor, incomingTarget);
                 const animDuration = getConveyorAnimationDuration(shiftCount);
 
@@ -713,7 +742,7 @@
                 setConveyorAnim(true);
 
                 setTimeout(() => {
-                    const { nextConveyor: newConveyor, nextIncoming: newIncomingTarget } = buildConveyorAdvanceResult(conveyor, incomingTarget, shiftCount);
+                    const { nextConveyor: newConveyor, nextIncoming: newIncomingTarget } = buildConveyorAdvanceResult(conveyor, incomingTarget, shiftCount, score);
                     const nextAdvanceCount = advanceCount + shiftCount;
 
                     setConveyorAnim(false);
@@ -754,9 +783,9 @@
                 resolvePendingRef.current = false;
                 resolvingRowsRef.current = false;
                 setGrid(createEmptyGrid());
-                const nextConveyor = createConveyorTargets();
+                const nextConveyor = createConveyorTargets(0);
                 setConveyor(nextConveyor);
-                setIncomingTarget(generateTargetExcluding(nextConveyor[0]));
+                setIncomingTarget(generateTargetExcluding(nextConveyor[0], 0));
                 setActiveTile(null);
                 setQueue([generateTile(), generateTile()]);
                 setGameOver(false);
