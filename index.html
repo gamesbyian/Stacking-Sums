@@ -117,6 +117,22 @@
             text-shadow: 0 1px 4px rgba(0,0,0,0.8);
         }
 
+        .swap-armed {
+            border-color: rgba(255, 255, 255, 0.52);
+            box-shadow: 0 0 14px rgba(255, 255, 255, 0.2), inset 0 2px 8px rgba(0,0,0,0.45);
+            transform: scale(1.02);
+        }
+
+        @keyframes targetSwapSnap {
+            0% { transform: translateY(0) scale(1); opacity: 1; filter: blur(0px); }
+            35% { transform: translateY(-4px) scale(0.95); opacity: 0.45; filter: blur(1px); }
+            100% { transform: translateY(0) scale(1); opacity: 1; filter: blur(0px); }
+        }
+
+        .target-swap-anim {
+            animation: targetSwapSnap 200ms cubic-bezier(0.2, 0.85, 0.28, 1);
+        }
+
         /* Progress ring */
         .progress-ring__circle {
             transform: rotate(-90deg);
@@ -182,6 +198,12 @@
         const DEMO_LOOKAHEAD_FACTOR = 0.4;
         const CELL_SIZE = 56;
         const PAD = 8;
+        const SWAP_START = 2;
+        const SWAP_CAP = 3;
+        const SWAP_REGEN_MS = 40000;
+        const SWAP_DOUBLE_TAP_MS = 300;
+        const SWAP_FEEDBACK_MS = 1250;
+        const SWAP_ANIM_MS = 200;
 
         const DEMO_WEIGHTS = {
             // Clear priority (still the strongest axis).
@@ -345,6 +367,21 @@
             high: [19, 24],
             veryHigh: [25, 28]
         };
+        const bucketNames = Object.keys(targetBuckets);
+
+        const getBucketForTarget = (value) => (
+            bucketNames.find((bucketName) => {
+                const [min, max] = targetBuckets[bucketName];
+                return value >= min && value <= max;
+            }) || null
+        );
+
+        const pickDifferentBucket = (weights, currentBucket) => {
+            const options = bucketNames
+                .filter((bucketName) => bucketName !== currentBucket)
+                .map((bucketName) => ({ value: bucketName, weight: Math.max(weights[bucketName] || 0.01, 0.01) }));
+            return weightedPick(options);
+        };
 
         const generateTarget = (rowsClearedTotal = 0) => {
             const difficulty = getDifficulty(rowsClearedTotal);
@@ -365,6 +402,23 @@
                 nextTarget = generateTarget(rowsClearedTotal);
             }
             return nextTarget;
+        };
+        const generateSwapReplacementTarget = (previousValue, rowsClearedTotal = 0) => {
+            const difficulty = getDifficulty(rowsClearedTotal);
+            const weights = normalizeBucketWeights(getTargetWeights(difficulty));
+            const currentBucket = getBucketForTarget(previousValue);
+            const fallback = () => generateTargetExcluding(previousValue, rowsClearedTotal);
+
+            if (!currentBucket) return fallback();
+
+            for (let attempt = 0; attempt < 6; attempt++) {
+                const nextBucket = pickDifferentBucket(weights, currentBucket);
+                const [min, max] = targetBuckets[nextBucket];
+                const candidate = randomInt(min, max);
+                if (candidate !== previousValue) return candidate;
+            }
+
+            return fallback();
         };
         const createConveyorTargets = (rowsClearedTotal = 0) => {
             const targets = [];
@@ -488,9 +542,15 @@
             const [comboText, setComboText] = useState('');
             const [uiScale, setUiScale] = useState(1);
             const [advanceCount, setAdvanceCount] = useState(0);
+            const [resolvingRows, setResolvingRows] = useState([]);
+            const [swapsAvailable, setSwapsAvailable] = useState(SWAP_START);
+            const [swapRegenElapsedMs, setSwapRegenElapsedMs] = useState(0);
+            const [swapFeedback, setSwapFeedback] = useState(null);
+            const [armedSwapRow, setArmedSwapRow] = useState(null);
+            const [swapAnimatingRows, setSwapAnimatingRows] = useState({});
 
             // Refs
-            const stateRef = useRef({ grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount, animatingDrop, demoMode, conveyorAnim, clearingRows, explodingParticles, score, rowsClearedTotal });
+            const stateRef = useRef({ grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount, animatingDrop, demoMode, conveyorAnim, clearingRows, explodingParticles, score, rowsClearedTotal, swapsAvailable, swapRegenElapsedMs, resolvingRows, swapAnimatingRows });
             const tickTimerRef = useRef(null);
             const frameRef = useRef(null);
             const directDropCommitRef = useRef(null);
@@ -498,16 +558,26 @@
             const resolvePendingRef = useRef(false);
             const resolvingRowsRef = useRef(false);
             const allClearAwardedOnEmptyRef = useRef(false);
+            const swapRegenTickRef = useRef(null);
+            const armedSwapTimerRef = useRef(null);
+            const swapFeedbackTimerRef = useRef(null);
 
             useEffect(() => {
-                stateRef.current = { grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount, animatingDrop, demoMode, conveyorAnim, clearingRows, explodingParticles, score, rowsClearedTotal };
-            }, [grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount, animatingDrop, demoMode, conveyorAnim, clearingRows, explodingParticles, score, rowsClearedTotal]);
+                stateRef.current = { grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount, animatingDrop, demoMode, conveyorAnim, clearingRows, explodingParticles, score, rowsClearedTotal, swapsAvailable, swapRegenElapsedMs, resolvingRows, swapAnimatingRows };
+            }, [grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount, animatingDrop, demoMode, conveyorAnim, clearingRows, explodingParticles, score, rowsClearedTotal, swapsAvailable, swapRegenElapsedMs, resolvingRows, swapAnimatingRows]);
 
             useEffect(() => {
                 if (!conveyorAnim && resolvePendingRef.current) {
                     requestResolveVisibleMatches();
                 }
             }, [conveyorAnim]);
+
+            useEffect(() => {
+                if (gameOver || guideOpen || demoMode || conveyorAnim) {
+                    clearTimeout(armedSwapTimerRef.current);
+                    setArmedSwapRow(null);
+                }
+            }, [gameOver, guideOpen, demoMode, conveyorAnim]);
 
             // Unified Spawner
             const spawnTileForSliding = () => {
@@ -959,6 +1029,7 @@
                 resolvingRowsRef.current = true;
                 resolvePendingRef.current = false;
                 setClearingRows(matchingRows);
+                setResolvingRows(matchingRows);
 
                 // Evaluate bonuses from pre-clear row content.
                 const seriesBonusCount = matchingRows.reduce((count, rowIndex) => (
@@ -1022,6 +1093,7 @@
                     setTimeout(() => {
                         setExplodingParticles([]);
                         resolvingRowsRef.current = false;
+                        setResolvingRows([]);
                         requestResolveVisibleMatches(collapsedGrid, stateRef.current.conveyor);
                     }, 600);
                 }, 1000);
@@ -1796,6 +1868,85 @@
                 return Math.round(MAX_TICK_MS - (MAX_TICK_MS - MIN_TICK_MS) * t);
             };
 
+            const canInteractWithSwapRow = useCallback((rowIndex) => {
+                const current = stateRef.current;
+                const rowIsResolving = current.clearingRows.includes(rowIndex) || current.resolvingRows.includes(rowIndex);
+                return !(
+                    current.swapsAvailable <= 0
+                    || current.gameOver
+                    || current.guideOpen
+                    || current.demoMode
+                    || current.conveyorAnim
+                    || rowIsResolving
+                    || resolvingRowsRef.current
+                    || current.swapAnimatingRows[rowIndex]
+                );
+            }, []);
+
+            const showSwapFeedback = useCallback((line1, line2) => {
+                clearTimeout(swapFeedbackTimerRef.current);
+                setSwapFeedback({ line1, line2, nonce: Date.now() + Math.random() });
+                swapFeedbackTimerRef.current = setTimeout(() => {
+                    setSwapFeedback(null);
+                }, SWAP_FEEDBACK_MS);
+            }, []);
+
+            const getSwapSecondsToNext = useCallback(() => {
+                const elapsed = stateRef.current.swapRegenElapsedMs;
+                return Math.max(1, Math.ceil((SWAP_REGEN_MS - elapsed) / 1000));
+            }, []);
+
+            const executeSwapForRow = useCallback((rowIndex) => {
+                if (!canInteractWithSwapRow(rowIndex)) {
+                    if (stateRef.current.swapsAvailable <= 0 && !stateRef.current.demoMode && !stateRef.current.gameOver && !stateRef.current.guideOpen) {
+                        const secondsToNext = getSwapSecondsToNext();
+                        showSwapFeedback('No swaps', `+1 in ${secondsToNext}s`);
+                    }
+                    return;
+                }
+
+                const oldTarget = stateRef.current.conveyor[rowIndex];
+                const replacement = generateSwapReplacementTarget(oldTarget, stateRef.current.rowsClearedTotal);
+
+                setConveyor((prev) => {
+                    const next = [...prev];
+                    next[rowIndex] = replacement;
+                    return next;
+                });
+                setSwapsAvailable((prev) => Math.max(0, prev - 1));
+                setSwapRegenElapsedMs((prevElapsed) => (
+                    stateRef.current.swapsAvailable === SWAP_CAP ? 0 : prevElapsed
+                ));
+                setArmedSwapRow(null);
+                setSwapAnimatingRows((prev) => ({ ...prev, [rowIndex]: true }));
+                setTimeout(() => {
+                    setSwapAnimatingRows((prev) => {
+                        const next = { ...prev };
+                        delete next[rowIndex];
+                        return next;
+                    });
+                }, SWAP_ANIM_MS);
+
+                const swapsAfterUse = Math.max(0, stateRef.current.swapsAvailable - 1);
+                showSwapFeedback('-1 Swap', `${swapsAfterUse} left`);
+            }, [canInteractWithSwapRow, getSwapSecondsToNext, showSwapFeedback]);
+
+            const handleConveyorTargetTap = useCallback((rowIndex) => {
+                if (stateRef.current.demoMode || stateRef.current.gameOver || stateRef.current.guideOpen) return;
+                if (armedSwapRow === rowIndex) {
+                    clearTimeout(armedSwapTimerRef.current);
+                    setArmedSwapRow(null);
+                    executeSwapForRow(rowIndex);
+                    return;
+                }
+
+                setArmedSwapRow(rowIndex);
+                clearTimeout(armedSwapTimerRef.current);
+                armedSwapTimerRef.current = setTimeout(() => {
+                    setArmedSwapRow((currentArmed) => (currentArmed === rowIndex ? null : currentArmed));
+                }, SWAP_DOUBLE_TAP_MS);
+            }, [armedSwapRow, executeSwapForRow]);
+
             const getCascadeScore = (clearedRows) => {
                 const base = clearedRows * 100;
                 const bonus = clearedRows > 1 ? (clearedRows - 1) * clearedRows * 50 : 0;
@@ -1835,6 +1986,32 @@
                 return () => clearTimeout(tickTimerRef.current);
             }, [gameOver, guideOpen, currentTickMs, tickCycle]);
 
+            useEffect(() => {
+                const regenActive = !gameOver && !guideOpen && !demoMode;
+                if (!regenActive) return undefined;
+
+                swapRegenTickRef.current = setInterval(() => {
+                    const current = stateRef.current;
+                    if (current.swapsAvailable >= SWAP_CAP) {
+                        if (current.swapRegenElapsedMs !== SWAP_REGEN_MS) {
+                            setSwapRegenElapsedMs(SWAP_REGEN_MS);
+                        }
+                        return;
+                    }
+
+                    setSwapRegenElapsedMs((prevElapsed) => {
+                        const updatedElapsed = prevElapsed + 250;
+                        if (updatedElapsed >= SWAP_REGEN_MS) {
+                            setSwapsAvailable((prevSwaps) => Math.min(SWAP_CAP, prevSwaps + 1));
+                            return 0;
+                        }
+                        return updatedElapsed;
+                    });
+                }, 250);
+
+                return () => clearInterval(swapRegenTickRef.current);
+            }, [gameOver, guideOpen, demoMode]);
+
             const resetGameState = ({ nextDemoMode = false, nextMode = stateRef.current.mode } = {}) => {
                 clearTimeout(directDropCommitRef.current);
                 clearTimeout(demoTimerRef.current);
@@ -1860,6 +2037,15 @@
                 setAnimatingDrop(null);
                 setMode(nextMode);
                 setDemoMode(nextDemoMode);
+                setResolvingRows([]);
+                setSwapsAvailable(SWAP_START);
+                setSwapRegenElapsedMs(0);
+                setSwapFeedback(null);
+                setArmedSwapRow(null);
+                setSwapAnimatingRows({});
+                clearInterval(swapRegenTickRef.current);
+                clearTimeout(armedSwapTimerRef.current);
+                clearTimeout(swapFeedbackTimerRef.current);
                 allClearAwardedOnEmptyRef.current = false;
             };
 
@@ -1908,6 +2094,9 @@
                     clearTimeout(tickTimerRef.current);
                     clearTimeout(directDropCommitRef.current);
                     clearTimeout(demoTimerRef.current);
+                    clearInterval(swapRegenTickRef.current);
+                    clearTimeout(armedSwapTimerRef.current);
+                    clearTimeout(swapFeedbackTimerRef.current);
                     window.removeEventListener('resize', updateUiScale);
                     window.removeEventListener('orientationchange', updateUiScale);
                 };
@@ -1988,9 +2177,20 @@
 
                             {/* Right Pane: Conveyor Timer */}
                             <div className="liquid-panel px-8 py-3 flex flex-col items-center justify-center min-w-[120px]">
-                                <div className="flex flex-col items-center">
+                                <div className="flex flex-col items-center h-[84px] justify-between">
                                     <div className="text-[10px] uppercase tracking-widest opacity-60 mb-2 font-bold text-white">Conveyor</div>
-                                    <ProgressRing durationMs={currentTickMs} running={!gameOver && !guideOpen} cycleNonce={tickCycle} />
+                                    <div className="relative w-12 h-12">
+                                        <div className={`absolute inset-0 transition-opacity duration-150 ${swapFeedback ? 'opacity-0' : 'opacity-100'}`}>
+                                            <ProgressRing durationMs={currentTickMs} running={!gameOver && !guideOpen} cycleNonce={tickCycle} />
+                                        </div>
+                                        <div className={`absolute inset-0 flex flex-col items-center justify-center transition-opacity duration-150 ${swapFeedback ? 'opacity-100' : 'opacity-0'}`}>
+                                            <div className="text-[11px] font-semibold leading-none text-white">{swapFeedback ? swapFeedback.line1 : ''}</div>
+                                            <div className="text-[9px] leading-none text-white/70 mt-1">{swapFeedback ? swapFeedback.line2 : ''}</div>
+                                        </div>
+                                    </div>
+                                    <div className="h-[12px] mt-1 text-[10px] tracking-wide text-white/60 tabular-nums">
+                                        Swaps {swapsAvailable}/{SWAP_CAP}
+                                    </div>
                                 </div>
                             </div>
                         </div>
@@ -2128,6 +2328,9 @@
                                             // Keeps the matched style locked while conveyorAnim is false.
                                             // When vibrating happens, conveyorAnim is false, so it stays lit.
                                             const isMatch = !conveyorAnim && hasTiles && sum === target;
+                                            const isResolvingRow = clearingRows.includes(idx) || resolvingRows.includes(idx);
+                                            const isSwapAnimating = !!swapAnimatingRows[idx];
+                                            const canInteract = !isMatch && !isResolvingRow && !conveyorAnim && !demoMode && !gameOver && !guideOpen && !swapAnimatingRows[idx];
 
                                             return (
                                                 <div
@@ -2135,9 +2338,14 @@
                                                     className="absolute w-full flex items-center justify-center z-10"
                                                     style={{ height: `${CELL_SIZE}px`, top: `${idx * CELL_SIZE}px` }}
                                                 >
-                                                    <div className={`w-12 h-12 rounded-xl flex items-center justify-center transition-colors duration-300 ${isMatch ? 'target-matched' : 'target-tile'}`}>
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => handleConveyorTargetTap(idx)}
+                                                        disabled={!canInteract}
+                                                        className={`w-12 h-12 rounded-xl flex items-center justify-center transition-colors duration-300 ${isMatch ? 'target-matched' : 'target-tile'} ${armedSwapRow === idx ? 'swap-armed' : ''} ${isSwapAnimating ? 'target-swap-anim' : ''} ${canInteract ? 'cursor-pointer' : 'cursor-default'}`}
+                                                    >
                                                         <span>{target}</span>
-                                                    </div>
+                                                    </button>
                                                 </div>
                                             );
                                         })}
@@ -2214,6 +2422,9 @@
                                         <ul className="space-y-2 text-sm sm:text-base text-white/90 leading-relaxed">
                                             <li>• In Direct Drop mode, click a column to drop the current tile into it.</li>
                                             <li>• In Sliding Placement mode, move the falling tile with the arrow keys.</li>
+                                            <li>• You begin with 2 swaps, can store up to 3, and regenerate 1 swap every 40 seconds.</li>
+                                            <li>• Double-tap a conveyor target tile to reroll that specific row target.</li>
+                                            <li>• Swaps are best saved for awkward rows that are hard to finish.</li>
                                             <li>• Plan ahead using the next-tile preview.</li>
                                             <li>• Set up rows that are close to matching, then use later tiles or falling cascades to finish them.</li>
                                             <li>• Chain reactions can clear multiple rows and score big points.</li>
