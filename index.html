@@ -309,19 +309,77 @@
             }
             return weightedValues[weightedValues.length - 1].value;
         };
+        const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
         // Bias toward smaller digits so players can shape sums incrementally.
-        const generateTile = () => weightedPick([
-            { value: 0, weight: 7 },
-            { value: 1, weight: 12 },
-            { value: 2, weight: 12 },
-            { value: 3, weight: 11 },
-            { value: 4, weight: 10 },
-            { value: 5, weight: 9 },
-            { value: 6, weight: 8 },
-            { value: 7, weight: 5 },
-            { value: 8, weight: 4 },
-            { value: 9, weight: 3 }
-        ]);
+        // Optional context applies subtle, probabilistic assistance while preserving plausible randomness.
+        const generateTile = ({ rowsClearedTotal = 0, grid = null, conveyor = null, recentTiles = [] } = {}) => {
+            const baseWeights = [
+                { value: 0, weight: 7 },
+                { value: 1, weight: 12 },
+                { value: 2, weight: 12 },
+                { value: 3, weight: 11 },
+                { value: 4, weight: 10 },
+                { value: 5, weight: 9 },
+                { value: 6, weight: 8 },
+                { value: 7, weight: 5 },
+                { value: 8, weight: 4 },
+                { value: 9, weight: 3 }
+            ].map((entry) => ({ ...entry }));
+
+            const adjustWeight = (tileValue, factor) => {
+                const found = baseWeights.find((entry) => entry.value === tileValue);
+                if (!found) return;
+                found.weight = Math.max(0.1, found.weight * factor);
+            };
+
+            // Near-miss assist: if a row is close, occasionally tilt probabilities near the needed value.
+            if (grid && conveyor && grid.length === ROWS && conveyor.length === ROWS) {
+                const nearMissRows = [];
+                for (let rowIndex = 0; rowIndex < ROWS; rowIndex++) {
+                    const row = grid[rowIndex];
+                    const hasTiles = row.some((cell) => cell !== null);
+                    if (!hasTiles) continue;
+                    const filled = row.reduce((count, cell) => count + (cell !== null ? 1 : 0), 0);
+                    const remainingCapacity = COLS - filled;
+                    if (remainingCapacity < 1) continue;
+                    const currentSum = row.reduce((sum, cell) => sum + (cell !== null ? cell : 0), 0);
+                    const diff = conveyor[rowIndex] - currentSum;
+                    if (diff >= 1 && diff <= 7) {
+                        nearMissRows.push({
+                            rowIndex,
+                            needed: diff,
+                            weight: (8 - diff) * 1.8 + ((rowIndex + 1) * 0.08)
+                        });
+                    }
+                }
+
+                if (nearMissRows.length > 0 && Math.random() < 0.24) {
+                    const selected = weightedPick(nearMissRows.map((row) => ({ value: row, weight: row.weight })));
+                    const neededValues = [
+                        clamp(selected.needed - 1, 0, 9),
+                        clamp(selected.needed, 0, 9),
+                        clamp(selected.needed + 1, 0, 9)
+                    ];
+                    neededValues.forEach((value) => adjustWeight(value, 1.45));
+                }
+            }
+
+            // Anti-sludge guard: in mid/late runs, soften extended low-roll streaks.
+            if (rowsClearedTotal >= 16 && recentTiles.length >= 8) {
+                const rollingWindow = recentTiles.slice(-10);
+                const avg = rollingWindow.reduce((sum, value) => sum + value, 0) / rollingWindow.length;
+                const difficulty = getDifficulty(rowsClearedTotal);
+                const lowStreakThreshold = 2.9 + (difficulty * 1.4);
+                if (avg < lowStreakThreshold) {
+                    adjustWeight(0, 0.92);
+                    adjustWeight(1, 0.88);
+                    adjustWeight(2, 0.88);
+                    [5, 6, 7, 8].forEach((value) => adjustWeight(value, 1.12));
+                }
+            }
+
+            return weightedPick(baseWeights);
+        };
 
         const getDifficulty = (rowsClearedTotal) => Math.min(rowsClearedTotal / TARGET_ROW_COUNT, 1);
         const softenLateWeight = (earlyWeight, lateWeight) => earlyWeight + ((lateWeight - earlyWeight) * TARGET_RAMP_SOFTENING);
@@ -403,22 +461,84 @@
             }
             return nextTarget;
         };
-        const generateSwapReplacementTarget = (previousValue, rowsClearedTotal = 0) => {
+        let lastSwapGenerationMode = null;
+        const generateSwapReplacementTarget = (previousValue, rowsClearedTotal = 0, grid = null, conveyor = null, swappedRowIndex = -1) => {
             const difficulty = getDifficulty(rowsClearedTotal);
             const weights = normalizeBucketWeights(getTargetWeights(difficulty));
             const currentBucket = getBucketForTarget(previousValue);
             const fallback = () => generateTargetExcluding(previousValue, rowsClearedTotal);
 
-            if (!currentBucket) return fallback();
+            // Clean reroll mode (existing behavior): shift to a different target bucket.
+            const chooseModeC = () => {
+                if (!currentBucket) return fallback();
+                for (let attempt = 0; attempt < 6; attempt++) {
+                    const nextBucket = pickDifferentBucket(weights, currentBucket);
+                    const [min, max] = targetBuckets[nextBucket];
+                    const candidate = randomInt(min, max);
+                    if (candidate !== previousValue) return candidate;
+                }
+                return fallback();
+            };
 
-            for (let attempt = 0; attempt < 6; attempt++) {
-                const nextBucket = pickDifferentBucket(weights, currentBucket);
-                const [min, max] = targetBuckets[nextBucket];
-                const candidate = randomInt(min, max);
-                if (candidate !== previousValue) return candidate;
+            if (!grid || !conveyor || grid.length !== ROWS || conveyor.length !== ROWS) {
+                lastSwapGenerationMode = 'clean';
+                return chooseModeC();
             }
 
-            return fallback();
+            const rowContext = [];
+            for (let rowIndex = 0; rowIndex < ROWS; rowIndex++) {
+                const row = grid[rowIndex];
+                const fillCount = row.reduce((count, cell) => count + (cell !== null ? 1 : 0), 0);
+                const hasTiles = fillCount > 0;
+                if (!hasTiles) continue;
+                const sum = row.reduce((running, cell) => running + (cell !== null ? cell : 0), 0);
+                const remainingCapacity = COLS - fillCount;
+                const target = conveyor[rowIndex];
+                rowContext.push({
+                    rowIndex,
+                    sum,
+                    fillCount,
+                    remainingCapacity,
+                    hasTiles,
+                    isDeadRow: (sum + (remainingCapacity * 9)) < target
+                });
+            }
+
+            const swappedRow = rowContext.find((row) => row.rowIndex === swappedRowIndex) || null;
+            const lowerRows = rowContext.filter((row) => row.rowIndex > swappedRowIndex);
+
+            const clutchWeight = lastSwapGenerationMode === 'clutch' ? 0.035 : 0.07;
+            const assistWeight = 0.40;
+            const cleanWeight = 1 - (clutchWeight + assistWeight);
+            const selectedMode = weightedPick([
+                { value: 'clutch', weight: clutchWeight },
+                { value: 'assist', weight: assistWeight },
+                { value: 'clean', weight: cleanWeight }
+            ]);
+
+            if (selectedMode === 'clutch' && swappedRow && swappedRow.hasTiles && swappedRow.sum !== previousValue) {
+                lastSwapGenerationMode = 'clutch';
+                return swappedRow.sum;
+            }
+
+            if (selectedMode === 'assist') {
+                const assistCandidates = lowerRows.map((row) => {
+                    let weight = 1 + (row.fillCount * 0.35);
+                    if (row.isDeadRow) weight += 5;
+                    weight += (1 / (row.remainingCapacity + 0.75)) * 2.2;
+                    return { value: row, weight };
+                });
+                if (assistCandidates.length > 0) {
+                    const pickedRow = weightedPick(assistCandidates);
+                    if (pickedRow.sum !== previousValue) {
+                        lastSwapGenerationMode = 'assist';
+                        return pickedRow.sum;
+                    }
+                }
+            }
+
+            lastSwapGenerationMode = 'clean';
+            return chooseModeC();
         };
         const createConveyorTargets = (rowsClearedTotal = 0) => {
             const targets = [];
@@ -522,6 +642,7 @@
             const [grid, setGrid] = useState(createEmptyGrid());
             const [activeTile, setActiveTile] = useState(null);
             const [queue, setQueue] = useState([generateTile(), generateTile()]);
+            const recentTilesRef = useRef([...queue]);
             const [conveyor, setConveyor] = useState(initialTargetState.current.conveyor);
             const [incomingTarget, setIncomingTarget] = useState(initialTargetState.current.incoming);
             const [conveyorAnim, setConveyorAnim] = useState(false);
@@ -562,6 +683,18 @@
             const armedSwapTimerRef = useRef(null);
             const swapFeedbackTimerRef = useRef(null);
 
+            const drawNextTile = useCallback((contextOverrides = {}) => {
+                const current = stateRef.current;
+                const nextTile = generateTile({
+                    rowsClearedTotal: contextOverrides.rowsClearedTotal ?? current.rowsClearedTotal,
+                    grid: contextOverrides.grid ?? current.grid,
+                    conveyor: contextOverrides.conveyor ?? current.conveyor,
+                    recentTiles: recentTilesRef.current
+                });
+                recentTilesRef.current = [...recentTilesRef.current, nextTile].slice(-10);
+                return nextTile;
+            }, []);
+
             useEffect(() => {
                 stateRef.current = { grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount, animatingDrop, demoMode, conveyorAnim, clearingRows, explodingParticles, score, rowsClearedTotal, swapsAvailable, swapRegenElapsedMs, resolvingRows, swapAnimatingRows };
             }, [grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount, animatingDrop, demoMode, conveyorAnim, clearingRows, explodingParticles, score, rowsClearedTotal, swapsAvailable, swapRegenElapsedMs, resolvingRows, swapAnimatingRows]);
@@ -587,7 +720,7 @@
                         return;
                     }
                     setActiveTile({ x: 2, y: 0, val: stateRef.current.queue[0] });
-                    setQueue(prev => [prev[1], generateTile()]);
+                    setQueue(prev => [prev[1], drawNextTile()]);
                 }
             };
 
@@ -1109,7 +1242,7 @@
                 if (stateRef.current.mode === 'sliding') {
                     setActiveTile(null);
                 } else {
-                    setQueue(prev => [prev[1], generateTile()]);
+                    setQueue(prev => [prev[1], drawNextTile({ grid: newGrid })]);
                 }
             };
 
@@ -1906,7 +2039,13 @@
                 }
 
                 const oldTarget = stateRef.current.conveyor[rowIndex];
-                const replacement = generateSwapReplacementTarget(oldTarget, stateRef.current.rowsClearedTotal);
+                const replacement = generateSwapReplacementTarget(
+                    oldTarget,
+                    stateRef.current.rowsClearedTotal,
+                    stateRef.current.grid,
+                    stateRef.current.conveyor,
+                    rowIndex
+                );
 
                 setConveyor((prev) => {
                     const next = [...prev];
@@ -2022,7 +2161,10 @@
                 setConveyor(nextConveyor);
                 setIncomingTarget(generateTargetExcluding(nextConveyor[0], 0));
                 setActiveTile(null);
-                setQueue([generateTile(), generateTile()]);
+                const firstTile = generateTile();
+                const secondTile = generateTile();
+                recentTilesRef.current = [firstTile, secondTile];
+                setQueue([firstTile, secondTile]);
                 setGameOver(false);
                 setConveyorAnim(false);
                 setConveyorAnimShift(1);
@@ -2047,6 +2189,7 @@
                 clearTimeout(armedSwapTimerRef.current);
                 clearTimeout(swapFeedbackTimerRef.current);
                 allClearAwardedOnEmptyRef.current = false;
+                lastSwapGenerationMode = null;
             };
 
             const restart = () => {
