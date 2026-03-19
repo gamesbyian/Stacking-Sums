@@ -139,23 +139,31 @@
 
         .swap-armed-icon {
             position: absolute;
-            inset: 0;
+            top: 4px;
+            right: 4px;
+            width: 18px;
+            height: 18px;
             display: flex;
             align-items: center;
             justify-content: center;
             pointer-events: none;
-            opacity: 0.28;
+            z-index: 2;
+            border-radius: 999px;
+            background: rgba(255, 255, 255, 0.16);
+            border: 1px solid rgba(255, 255, 255, 0.32);
+            box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45);
+            color: rgba(255, 255, 255, 0.95);
         }
 
         .swap-armed-icon svg {
-            width: 18px;
-            height: 18px;
+            width: 11px;
+            height: 11px;
             filter: drop-shadow(0 1px 2px rgba(0,0,0,0.45));
         }
 
         .target-number {
             position: relative;
-            z-index: 1;
+            z-index: 3;
         }
 
         /* Progress ring */
@@ -2627,15 +2635,15 @@
                                                         onClick={() => handleConveyorTargetTap(idx)}
                                                         disabled={!canInteract}
                                                         data-pending-target={pendingSwapValues[idx] ?? ''}
-                                                        className={`relative w-12 h-12 rounded-xl flex items-center justify-center transition-colors duration-300 ${isMatch ? 'target-matched' : 'target-tile'} ${armedSwapRow === idx ? 'swap-armed' : ''} ${isSwapAnimating ? 'target-swap-anim' : ''} ${canInteract ? 'cursor-pointer' : 'cursor-default'}`}
+                                                        className={`relative isolate w-12 h-12 rounded-xl flex items-center justify-center transition-colors duration-300 ${isMatch ? 'target-matched' : 'target-tile'} ${armedSwapRow === idx ? 'swap-armed' : ''} ${isSwapAnimating ? 'target-swap-anim' : ''} ${canInteract ? 'cursor-pointer' : 'cursor-default'}`}
                                                     >
                                                         {armedSwapRow === idx && (
                                                             <span className="swap-armed-icon" aria-hidden="true">
                                                                 <svg viewBox="0 0 24 24" fill="none">
-                                                                    <path d="M19 7.5A7.2 7.2 0 0 0 6.4 5.6" stroke="rgba(255,255,255,0.75)" strokeWidth="1.8" strokeLinecap="round"/>
-                                                                    <path d="m5.8 3.8.6 2.8 2.8-.6" stroke="rgba(255,255,255,0.75)" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
-                                                                    <path d="M5 16.5a7.2 7.2 0 0 0 12.6 1.9" stroke="rgba(255,255,255,0.75)" strokeWidth="1.8" strokeLinecap="round"/>
-                                                                    <path d="m18.2 20.2-.6-2.8-2.8.6" stroke="rgba(255,255,255,0.75)" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
+                                                                    <path d="M19 7.5A7.2 7.2 0 0 0 6.4 5.6" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/>
+                                                                    <path d="m5.8 3.8.6 2.8 2.8-.6" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
+                                                                    <path d="M5 16.5a7.2 7.2 0 0 0 12.6 1.9" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/>
+                                                                    <path d="m18.2 20.2-.6-2.8-2.8.6" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
                                                                 </svg>
                                                             </span>
                                                         )}
