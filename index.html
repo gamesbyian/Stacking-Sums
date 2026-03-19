@@ -139,26 +139,19 @@
 
         .swap-armed-icon {
             position: absolute;
-            top: 4px;
-            right: 4px;
-            width: 18px;
-            height: 18px;
+            inset: 0;
             display: flex;
             align-items: center;
             justify-content: center;
             pointer-events: none;
-            z-index: 2;
-            border-radius: 999px;
-            background: rgba(255, 255, 255, 0.16);
-            border: 1px solid rgba(255, 255, 255, 0.32);
-            box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45);
-            color: rgba(255, 255, 255, 0.95);
+            z-index: 1;
+            color: rgba(255, 255, 255, 0.42);
         }
 
         .swap-armed-icon svg {
-            width: 11px;
-            height: 11px;
-            filter: drop-shadow(0 1px 2px rgba(0,0,0,0.45));
+            width: 24px;
+            height: 24px;
+            filter: drop-shadow(0 1px 3px rgba(0,0,0,0.35));
         }
 
         .target-number {
@@ -237,6 +230,10 @@
         const SWAP_ARM_TIMEOUT_MS = 1500;
         const SWAP_FEEDBACK_MS = 1250;
         const SWAP_ANIM_MS = 240;
+        const DEMO_SWAP_ARM_DELAY_MS = 360;
+        const DEMO_SWAP_ARM_DELAY_JITTER_MS = 110;
+        const DEMO_SWAP_POST_PAUSE_MS = 520;
+        const DEMO_SWAP_POST_PAUSE_JITTER_MS = 120;
 
         const DEMO_WEIGHTS = {
             // Clear priority (still the strongest axis).
@@ -719,6 +716,9 @@
             const swapMidpointTimersRef = useRef({});
             const swapEndTimersRef = useRef({});
             const demoSwapPauseUntilRef = useRef(0);
+            const demoSwapInProgressRef = useRef(false);
+            const demoSwapArmTimerRef = useRef(null);
+            const demoSwapPostTimerRef = useRef(null);
 
             const drawNextTile = useCallback((contextOverrides = {}) => {
                 const current = stateRef.current;
@@ -749,6 +749,14 @@
                     setArmedSwapRow((currentArmed) => (currentArmed === rowIndex ? null : currentArmed));
                     armedSwapTimerRef.current = null;
                 }, SWAP_ARM_TIMEOUT_MS);
+            }, []);
+
+            const clearDemoSwapStaging = useCallback(() => {
+                clearTimeout(demoSwapArmTimerRef.current);
+                clearTimeout(demoSwapPostTimerRef.current);
+                demoSwapArmTimerRef.current = null;
+                demoSwapPostTimerRef.current = null;
+                demoSwapInProgressRef.current = false;
             }, []);
 
             useEffect(() => {
@@ -2195,6 +2203,7 @@
 
             useEffect(() => {
                 if (!demoMode || gameOver || guideOpen || mode !== 'direct' || animatingDrop || conveyorAnim || clearingRows.length > 0 || explodingParticles.length > 0) return;
+                if (demoSwapInProgressRef.current) return;
 
                 const now = Date.now();
                 const pauseRemaining = Math.max(0, demoSwapPauseUntilRef.current - now);
@@ -2202,25 +2211,46 @@
 
                 demoTimerRef.current = setTimeout(() => {
                     const current = stateRef.current;
+                    if (!current.demoMode || demoSwapInProgressRef.current) return;
                     const bestDrop = chooseDemoColumn(current.grid, current.conveyor, current.incomingTarget, current.queue[0], current.queue[1], current.rowsClearedTotal);
                     const demoSwapRow = chooseDemoSwapRow(current, bestDrop);
                     if (demoSwapRow !== null) {
-                        const swapped = executeSwapForRow(demoSwapRow, { fromDemo: true });
-                        if (swapped) demoSwapPauseUntilRef.current = Date.now() + 260;
+                        demoSwapInProgressRef.current = true;
+                        armSwapRow(demoSwapRow);
+
+                        const armDelay = DEMO_SWAP_ARM_DELAY_MS + randomInt(0, DEMO_SWAP_ARM_DELAY_JITTER_MS);
+                        demoSwapArmTimerRef.current = setTimeout(() => {
+                            demoSwapArmTimerRef.current = null;
+                            const swapped = executeSwapForRow(demoSwapRow, { fromDemo: true });
+                            const postSwapPause = swapped
+                                ? DEMO_SWAP_POST_PAUSE_MS + randomInt(0, DEMO_SWAP_POST_PAUSE_JITTER_MS)
+                                : 220;
+                            demoSwapPauseUntilRef.current = Date.now() + postSwapPause;
+                            demoSwapPostTimerRef.current = setTimeout(() => {
+                                demoSwapPostTimerRef.current = null;
+                                demoSwapInProgressRef.current = false;
+                            }, postSwapPause);
+                        }, armDelay);
                         return;
                     }
                     if (bestDrop.col !== -1) startDirectDrop(bestDrop.col);
                 }, thinkDelay);
 
                 return () => clearTimeout(demoTimerRef.current);
-            }, [demoMode, gameOver, guideOpen, mode, animatingDrop, grid, conveyor, queue, conveyorAnim, clearingRows, explodingParticles, chooseDemoSwapRow, executeSwapForRow]);
+            }, [demoMode, gameOver, guideOpen, mode, animatingDrop, grid, conveyor, queue, conveyorAnim, clearingRows, explodingParticles, chooseDemoSwapRow, executeSwapForRow, armSwapRow]);
 
             useEffect(() => {
                 if (gameOver) {
+                    clearDemoSwapStaging();
                     cancelArmedSwap();
                     setDemoMode(false);
                 }
-            }, [gameOver, cancelArmedSwap]);
+            }, [gameOver, cancelArmedSwap, clearDemoSwapStaging]);
+
+            useEffect(() => {
+                if (demoMode && !gameOver && !guideOpen && mode === 'direct') return;
+                clearDemoSwapStaging();
+            }, [demoMode, gameOver, guideOpen, mode, clearDemoSwapStaging]);
 
             const getCascadeScore = (clearedRows) => {
                 const base = clearedRows * 100;
@@ -2291,6 +2321,7 @@
             const resetGameState = ({ nextDemoMode = false, nextMode = stateRef.current.mode } = {}) => {
                 clearTimeout(directDropCommitRef.current);
                 clearTimeout(demoTimerRef.current);
+                clearDemoSwapStaging();
                 cancelArmedSwap();
                 resolvePendingRef.current = false;
                 resolvingRowsRef.current = false;
@@ -2387,6 +2418,11 @@
                     clearInterval(swapRegenTickRef.current);
                     clearTimeout(armedSwapTimerRef.current);
                     clearTimeout(swapFeedbackTimerRef.current);
+                    clearTimeout(demoSwapArmTimerRef.current);
+                    clearTimeout(demoSwapPostTimerRef.current);
+                    demoSwapArmTimerRef.current = null;
+                    demoSwapPostTimerRef.current = null;
+                    demoSwapInProgressRef.current = false;
                     Object.values(swapMidpointTimersRef.current).forEach(clearTimeout);
                     Object.values(swapEndTimersRef.current).forEach(clearTimeout);
                     window.removeEventListener('resize', updateUiScale);
