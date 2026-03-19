@@ -144,19 +144,19 @@
             align-items: center;
             justify-content: center;
             pointer-events: none;
-            z-index: 1;
-            color: rgba(255, 255, 255, 0.42);
+            z-index: 4;
+            color: rgba(255, 255, 255, 0.58);
         }
 
         .swap-armed-icon svg {
-            width: 24px;
-            height: 24px;
-            filter: drop-shadow(0 1px 3px rgba(0,0,0,0.35));
+            width: 25px;
+            height: 25px;
+            filter: drop-shadow(0 1px 3px rgba(0,0,0,0.45));
         }
 
         .target-number {
             position: relative;
-            z-index: 3;
+            z-index: 2;
         }
 
         /* Progress ring */
@@ -700,6 +700,7 @@
             const [armedSwapRow, setArmedSwapRow] = useState(null);
             const [swapAnimatingRows, setSwapAnimatingRows] = useState({});
             const [pendingSwapValues, setPendingSwapValues] = useState({});
+            const [demoDecisionPulse, setDemoDecisionPulse] = useState(0);
 
             // Refs
             const stateRef = useRef({ grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount, animatingDrop, demoMode, conveyorAnim, clearingRows, explodingParticles, score, rowsClearedTotal, swapsAvailable, swapRegenElapsedMs, resolvingRows, swapAnimatingRows });
@@ -756,6 +757,7 @@
                 clearTimeout(demoSwapPostTimerRef.current);
                 demoSwapArmTimerRef.current = null;
                 demoSwapPostTimerRef.current = null;
+                demoSwapPauseUntilRef.current = 0;
                 demoSwapInProgressRef.current = false;
             }, []);
 
@@ -2216,19 +2218,33 @@
                     const demoSwapRow = chooseDemoSwapRow(current, bestDrop);
                     if (demoSwapRow !== null) {
                         demoSwapInProgressRef.current = true;
+                        clearTimeout(demoSwapArmTimerRef.current);
+                        clearTimeout(demoSwapPostTimerRef.current);
+                        demoSwapArmTimerRef.current = null;
+                        demoSwapPostTimerRef.current = null;
                         armSwapRow(demoSwapRow);
 
                         const armDelay = DEMO_SWAP_ARM_DELAY_MS + randomInt(0, DEMO_SWAP_ARM_DELAY_JITTER_MS);
                         demoSwapArmTimerRef.current = setTimeout(() => {
                             demoSwapArmTimerRef.current = null;
+                            const live = stateRef.current;
+                            if (!live.demoMode || live.gameOver || live.guideOpen || live.mode !== 'direct') {
+                                demoSwapPauseUntilRef.current = 0;
+                                demoSwapInProgressRef.current = false;
+                                setDemoDecisionPulse((prev) => prev + 1);
+                                return;
+                            }
                             const swapped = executeSwapForRow(demoSwapRow, { fromDemo: true });
                             const postSwapPause = swapped
                                 ? DEMO_SWAP_POST_PAUSE_MS + randomInt(0, DEMO_SWAP_POST_PAUSE_JITTER_MS)
                                 : 220;
                             demoSwapPauseUntilRef.current = Date.now() + postSwapPause;
+                            clearTimeout(demoSwapPostTimerRef.current);
                             demoSwapPostTimerRef.current = setTimeout(() => {
                                 demoSwapPostTimerRef.current = null;
+                                demoSwapPauseUntilRef.current = 0;
                                 demoSwapInProgressRef.current = false;
+                                setDemoDecisionPulse((prev) => prev + 1);
                             }, postSwapPause);
                         }, armDelay);
                         return;
@@ -2237,7 +2253,7 @@
                 }, thinkDelay);
 
                 return () => clearTimeout(demoTimerRef.current);
-            }, [demoMode, gameOver, guideOpen, mode, animatingDrop, grid, conveyor, queue, conveyorAnim, clearingRows, explodingParticles, chooseDemoSwapRow, executeSwapForRow, armSwapRow]);
+            }, [demoMode, gameOver, guideOpen, mode, animatingDrop, grid, conveyor, queue, conveyorAnim, clearingRows, explodingParticles, chooseDemoSwapRow, executeSwapForRow, armSwapRow, demoDecisionPulse]);
 
             useEffect(() => {
                 if (gameOver) {
