@@ -141,6 +141,27 @@
   const getTickDuration=(stateOrAdvances)=>{const advances=typeof stateOrAdvances==='number'?stateOrAdvances:stateOrAdvances.advanceCount; const t=Math.min(advances/C.TICK_RAMP_ADVANCES,1); return Math.round(C.MAX_TICK_MS-(C.MAX_TICK_MS-C.MIN_TICK_MS)*t);};
   const resolveVisibleMatches=(state)=>resolveSingleMatchStep(state);
 
+  const simulateWait=(state,rng=Math.random)=>{
+    const advance=advanceConveyorState(state,rng);
+    const matchingRowsBeforeResolution=[...advance.matchingRows];
+    const resolved=resolveAllVisibleMatches(advance.nextState);
+    const scoreDelta=resolved.totalScoreDelta;
+    const rowsCleared=resolved.steps.reduce((sum,step)=>sum+step.rowsCleared.length,0);
+    const seriesBonusCount=resolved.steps.reduce((sum,step)=>sum+step.seriesBonusCount,0);
+    const allClear=resolved.steps.some((step)=>step.allClear);
+    return {
+      nextState:resolved.finalState,
+      shiftDistance:advance.shiftDistance,
+      matchingRowsBeforeResolution,
+      rowsCleared,
+      scoreDelta,
+      allClear,
+      seriesBonusCount,
+      block:advance.block,
+      resolutionSteps:resolved.steps
+    };
+  };
+
   // Thin action-style reducer: orchestration/replay entry point built on the same pure primitives.
   const applyAction=(state,action,rng=Math.random)=>{
     if(!action||!action.type) return {applied:false,nextState:cloneGameState(state),action};
@@ -166,5 +187,5 @@
     }
   };
 
-  global.GameModel={createEmptyGrid,createInitialGameState,cloneGameState,getLandingRowForColumn,getLegalDirectDropColumns,simulateDirectDrop,applyDirectDrop,findMatchingRows,collapseGridForClearedRows,getConveyorValueAfterOneStep,findContiguousSameSumBlock,getConveyorAdvanceDistance,resolveSingleMatchStep,resolveAllVisibleMatches,resolveVisibleMatches,advanceConveyorState,canSwapRow,applySwap,tickSwapRegen,applyAction,getTickDuration,qualifiesForSeriesBonus:S.qualifiesForSeriesBonus,isAllClear:S.isAllClear};
+  global.GameModel={createEmptyGrid,createInitialGameState,cloneGameState,getLandingRowForColumn,getLegalDirectDropColumns,simulateDirectDrop,applyDirectDrop,findMatchingRows,collapseGridForClearedRows,getConveyorValueAfterOneStep,findContiguousSameSumBlock,getConveyorAdvanceDistance,resolveSingleMatchStep,resolveAllVisibleMatches,resolveVisibleMatches,advanceConveyorState,simulateWait,canSwapRow,applySwap,tickSwapRegen,applyAction,getTickDuration,qualifiesForSeriesBonus:S.qualifiesForSeriesBonus,isAllClear:S.isAllClear};
 })(window);
