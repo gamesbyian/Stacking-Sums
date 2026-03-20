@@ -230,6 +230,15 @@
         const DEMO_PAUSE_JITTER_MS = 180;
         const DEMO_IMMEDIATE_FACTOR = 0.6;
         const DEMO_LOOKAHEAD_FACTOR = 0.4;
+        const DEMO_WAIT_ADVANTAGE_THRESHOLD = 160;
+        const DEMO_WAIT_IMMEDIATE_CLEAR_BONUS = 280;
+        const DEMO_WAIT_FORECAST_CLEAR_BONUS = 130;
+        const DEMO_WAIT_DANGER_PENALTY = -260;
+        const DEMO_WAIT_TOP_PRESSURE_PENALTY = -180;
+        const DEMO_WAIT_DOOMED_ROW_PENALTY = -120;
+        const DEMO_WAIT_LOW_ACTIVITY_PENALTY = -110;
+        const DEMO_WAIT_CONSECUTIVE_LIMIT = 1;
+        const DEMO_WAIT_MAX_FORECAST_ADVANCES = 2;
         const CELL_SIZE = 56;
         const PAD = 8;
         const SWAP_START = 2;
@@ -470,6 +479,8 @@
             const demoSwapInProgressRef = useRef(false);
             const demoSwapArmTimerRef = useRef(null);
             const demoSwapPostTimerRef = useRef(null);
+            const demoConsecutiveWaitsRef = useRef(0);
+            const demoHoldUntilAdvanceRef = useRef(false);
 
             const drawNextTile = useCallback((contextOverrides = {}) => {
                 const current = stateRef.current;
@@ -514,6 +525,8 @@
                 demoSwapPostTimerRef.current = null;
                 demoSwapPauseUntilRef.current = 0;
                 demoSwapInProgressRef.current = false;
+                demoConsecutiveWaitsRef.current = 0;
+                demoHoldUntilAdvanceRef.current = false;
             }, []);
 
             useEffect(() => {
@@ -1607,7 +1620,104 @@
                 );
             };
 
-            const chooseDemoColumn = (sourceGrid, sourceConveyor, sourceIncomingTarget, currentTile, nextTile, rowsClearedCount) => {
+            const getTopPressureScore = (sourceGrid) => {
+                const heights = getColumnHeights(sourceGrid);
+                const maxHeight = Math.max(...heights);
+                const nearCapColumns = heights.filter((height) => height >= ROWS - 2).length;
+                return (maxHeight * 1.25) + (nearCapColumns * 2.5);
+            };
+
+            const evaluateSimulatedWait = ({
+                baseState,
+                waitResult,
+                bestDropScore
+            }) => {
+                if (!waitResult || !waitResult.nextState) {
+                    return {
+                        score: Number.NEGATIVE_INFINITY,
+                        meta: { immediateClears: 0, forecastMatches: 0, dangerScore: Infinity, shouldForceDrop: true, consecutivePenalty: 0 }
+                    };
+                }
+
+                const nextGrid = waitResult.nextState.grid;
+                const nextConveyor = waitResult.nextState.conveyor;
+                const difficulty = getDifficulty(baseState.rowsClearedTotal || 0);
+                const immediateClears = waitResult.matchingRowsBeforeResolution ? waitResult.matchingRowsBeforeResolution.length : 0;
+                const cascadeRows = waitResult.rowsCleared || 0;
+                const shiftDistance = waitResult.shiftDistance || 1;
+                const topPressure = getTopPressureScore(nextGrid);
+                const dangerScore = scoreImminentLossAvoidance({ nextGrid, landingRow: 0 }) * -1;
+
+                let score = waitResult.scoreDelta * 1.35;
+                score += scoreBoardHealth(nextGrid, nextConveyor, difficulty) * 0.3;
+
+                if (immediateClears > 0) {
+                    score += DEMO_WAIT_IMMEDIATE_CLEAR_BONUS + ((immediateClears - 1) * (DEMO_WAIT_IMMEDIATE_CLEAR_BONUS * 0.4));
+                }
+                if (cascadeRows > immediateClears) score += (cascadeRows - immediateClears) * 90;
+                if (waitResult.seriesBonusCount > 0) score += waitResult.seriesBonusCount * 120;
+                if (waitResult.allClear) score += 300;
+                if (waitResult.block && waitResult.block.length >= 2) score += 95 + (waitResult.block.length * 16);
+
+                let forecastMatches = 0;
+                for (let row = 0; row < ROWS; row++) {
+                    if (!rowHasTiles(nextGrid, row)) continue;
+                    const rowSum = getRowSumFromGrid(nextGrid, row);
+                    const upcoming = getUpcomingTargetsForRow(nextGrid, nextConveyor, waitResult.nextState.incomingTarget, row, DEMO_WAIT_MAX_FORECAST_ADVANCES);
+                    const concreteHit = upcoming.find(({ advancesAway, target }) => (
+                        target !== null
+                        && target !== undefined
+                        && target === rowSum
+                        && rowCanReasonablyWaitForTarget(nextGrid, row, rowSum, target, advancesAway).canWait
+                    ));
+                    if (concreteHit) {
+                        forecastMatches += 1;
+                        score += DEMO_WAIT_FORECAST_CLEAR_BONUS / concreteHit.advancesAway;
+                    }
+                }
+
+                let doomedRows = 0;
+                for (let row = 0; row < ROWS; row++) {
+                    if (!rowHasTiles(nextGrid, row)) continue;
+                    const rowSum = getRowSumFromGrid(nextGrid, row);
+                    if (isDeadRow(nextGrid, rowSum, row, nextConveyor, waitResult.nextState.incomingTarget, difficulty)) {
+                        doomedRows += 1;
+                    }
+                }
+                if (doomedRows > 0) score += doomedRows * DEMO_WAIT_DOOMED_ROW_PENALTY;
+                if (topPressure >= 12) score += DEMO_WAIT_TOP_PRESSURE_PENALTY;
+                if (dangerScore >= 420) score += DEMO_WAIT_DANGER_PENALTY;
+                if (immediateClears === 0 && forecastMatches === 0) score += DEMO_WAIT_LOW_ACTIVITY_PENALTY;
+                if (shiftDistance >= 2) score += 28;
+
+                const consecutiveWaits = demoConsecutiveWaitsRef.current;
+                const consecutivePenalty = consecutiveWaits > 0 ? consecutiveWaits * 120 : 0;
+                score -= consecutivePenalty;
+
+                const hasImmediatePayoff = immediateClears > 0 || waitResult.scoreDelta > 0;
+                const hasForecastPayoff = forecastMatches > 0;
+                const shouldForceDrop = (
+                    !hasImmediatePayoff
+                    && (!hasForecastPayoff || shiftDistance > 1)
+                    && bestDropScore > Number.NEGATIVE_INFINITY
+                );
+
+                return {
+                    score,
+                    meta: {
+                        immediateClears,
+                        forecastMatches,
+                        dangerScore,
+                        topPressure,
+                        doomedRows,
+                        consecutivePenalty,
+                        shiftDistance,
+                        shouldForceDrop
+                    }
+                };
+            };
+
+            const chooseDemoAction = (sourceGrid, sourceConveyor, sourceIncomingTarget, currentTile, nextTile, rowsClearedCount) => {
                 const gameState = buildModelState({
                     grid: sourceGrid.map((row) => [...row]),
                     queue: [currentTile, nextTile],
@@ -1617,8 +1727,9 @@
                     gameOver: false,
                     rowsClearedTotal: rowsClearedCount || 0
                 });
-                return GameDemoApi.chooseDemoColumn(gameState, (baseState, simulated, evalTile, evalNextTile) => (
-                    evaluateSimulatedMove(
+
+                const actionEval = GameDemoApi.chooseDemoAction(gameState, {
+                    evaluateDrop: (baseState, simulated, evalTile, evalNextTile) => evaluateSimulatedMove(
                         baseState.grid,
                         baseState.conveyor,
                         baseState.incomingTarget,
@@ -1626,8 +1737,42 @@
                         baseState.rowsClearedTotal,
                         evalTile,
                         evalNextTile
-                    )
-                ));
+                    ),
+                    evaluateWait: () => 0
+                });
+
+                const bestDrop = actionEval.bestDrop || { type: 'drop', col: -1, score: Number.NEGATIVE_INFINITY };
+                const waitAction = actionEval.waitAction || { type: 'wait', score: Number.NEGATIVE_INFINITY, simulation: null };
+                const waitEval = evaluateSimulatedWait({
+                    baseState: gameState,
+                    waitResult: waitAction.simulation,
+                    bestDropScore: bestDrop.score
+                });
+                const bestDropScore = bestDrop.score ?? Number.NEGATIVE_INFINITY;
+                const waitScore = waitEval.score;
+                const hasImmediateDrop = bestDropScore >= 900;
+                const waitMargin = waitScore - bestDropScore;
+                const consecutiveWaits = demoConsecutiveWaitsRef.current;
+                const overWaitLimit = consecutiveWaits >= DEMO_WAIT_CONSECUTIVE_LIMIT;
+                const waitHasImmediateClear = waitEval.meta.immediateClears > 0;
+                const waitHasNearForecast = waitEval.meta.forecastMatches > 0 && waitEval.meta.shiftDistance <= 1;
+                const waitAllowedByStallGuard = !overWaitLimit || waitHasImmediateClear || (waitHasNearForecast && waitMargin >= DEMO_WAIT_ADVANTAGE_THRESHOLD * 1.25);
+                const waitAllowedByDanger = waitEval.meta.topPressure < 14 && waitEval.meta.dangerScore < 560;
+                const waitBeatsThreshold = waitScore >= (bestDropScore + DEMO_WAIT_ADVANTAGE_THRESHOLD);
+
+                const shouldWait = (
+                    waitAllowedByStallGuard
+                    && waitAllowedByDanger
+                    && !hasImmediateDrop
+                    && !waitEval.meta.shouldForceDrop
+                    && (waitHasImmediateClear || waitBeatsThreshold || (bestDropScore < 260 && waitHasNearForecast && waitMargin >= 0))
+                );
+
+                return {
+                    chosenAction: shouldWait ? { type: 'wait', score: waitScore, reason: 'tactical-wait', meta: waitEval.meta } : bestDrop,
+                    bestDrop,
+                    waitCandidate: { ...waitAction, score: waitScore, reason: 'scored-wait', meta: waitEval.meta }
+                };
             };
 
             const startDirectDrop = (colIndex) => {
@@ -1873,9 +2018,12 @@
                 demoTimerRef.current = setTimeout(() => {
                     const current = stateRef.current;
                     if (!current.demoMode || demoSwapInProgressRef.current) return;
-                    const bestDrop = chooseDemoColumn(current.grid, current.conveyor, current.incomingTarget, current.queue[0], current.queue[1], current.rowsClearedTotal);
+                    if (demoHoldUntilAdvanceRef.current) return;
+                    const decision = chooseDemoAction(current.grid, current.conveyor, current.incomingTarget, current.queue[0], current.queue[1], current.rowsClearedTotal);
+                    const bestDrop = decision.bestDrop;
                     const demoSwapRow = chooseDemoSwapRow(current, bestDrop);
                     if (demoSwapRow !== null) {
+                        demoConsecutiveWaitsRef.current = 0;
                         demoSwapInProgressRef.current = true;
                         clearTimeout(demoSwapArmTimerRef.current);
                         clearTimeout(demoSwapPostTimerRef.current);
@@ -1908,6 +2056,14 @@
                         }, armDelay);
                         return;
                     }
+                    if (decision.chosenAction.type === 'wait') {
+                        demoConsecutiveWaitsRef.current += 1;
+                        demoHoldUntilAdvanceRef.current = true;
+                        demoSwapPauseUntilRef.current = Date.now() + Math.round(DEMO_THINK_MS * 0.7);
+                        setDemoDecisionPulse((prev) => prev + 1);
+                        return;
+                    }
+                    demoConsecutiveWaitsRef.current = 0;
                     if (bestDrop.col !== -1) startDirectDrop(bestDrop.col);
                 }, thinkDelay);
 
@@ -1948,6 +2104,7 @@
                     setConveyor(newConveyor);
                     setIncomingTarget(newIncomingTarget);
                     setAdvanceCount(nextAdvanceCount);
+                    demoHoldUntilAdvanceRef.current = false;
                     requestResolveVisibleMatches(grid, newConveyor);
                 }, animDuration); // Conveyor physical slide duration
             };
