@@ -335,274 +335,13 @@
             tier3: 1
         };
 
-        // Utility
-        const randomInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
-        const lerp = (a, b, t) => a + (b - a) * t;
-        const weightedPick = (weightedValues) => {
-            const totalWeight = weightedValues.reduce((sum, entry) => sum + entry.weight, 0);
-            let roll = Math.random() * totalWeight;
-            for (const entry of weightedValues) {
-                roll -= entry.weight;
-                if (roll <= 0) return entry.value;
-            }
-            return weightedValues[weightedValues.length - 1].value;
-        };
-        const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
-        // Bias toward smaller digits so players can shape sums incrementally.
-        // Optional context applies subtle, probabilistic assistance while preserving plausible randomness.
-        const generateTile = ({ rowsClearedTotal = 0, grid = null, conveyor = null, recentTiles = [] } = {}) => {
-            const baseWeights = [
-                { value: 0, weight: 7 },
-                { value: 1, weight: 12 },
-                { value: 2, weight: 12 },
-                { value: 3, weight: 11 },
-                { value: 4, weight: 10 },
-                { value: 5, weight: 9 },
-                { value: 6, weight: 8 },
-                { value: 7, weight: 5 },
-                { value: 8, weight: 4 },
-                { value: 9, weight: 3 }
-            ].map((entry) => ({ ...entry }));
-
-            const adjustWeight = (tileValue, factor) => {
-                const found = baseWeights.find((entry) => entry.value === tileValue);
-                if (!found) return;
-                found.weight = Math.max(0.1, found.weight * factor);
-            };
-
-            // Near-miss assist: if a row is close, occasionally tilt probabilities near the needed value.
-            if (grid && conveyor && grid.length === ROWS && conveyor.length === ROWS) {
-                const nearMissRows = [];
-                for (let rowIndex = 0; rowIndex < ROWS; rowIndex++) {
-                    const row = grid[rowIndex];
-                    const hasTiles = row.some((cell) => cell !== null);
-                    if (!hasTiles) continue;
-                    const filled = row.reduce((count, cell) => count + (cell !== null ? 1 : 0), 0);
-                    const remainingCapacity = COLS - filled;
-                    if (remainingCapacity < 1) continue;
-                    const currentSum = row.reduce((sum, cell) => sum + (cell !== null ? cell : 0), 0);
-                    const diff = conveyor[rowIndex] - currentSum;
-                    if (diff >= 1 && diff <= 7) {
-                        nearMissRows.push({
-                            rowIndex,
-                            needed: diff,
-                            weight: (8 - diff) * 1.8 + ((rowIndex + 1) * 0.08)
-                        });
-                    }
-                }
-
-                if (nearMissRows.length > 0 && Math.random() < 0.24) {
-                    const selected = weightedPick(nearMissRows.map((row) => ({ value: row, weight: row.weight })));
-                    const neededValues = [
-                        clamp(selected.needed - 1, 0, 9),
-                        clamp(selected.needed, 0, 9),
-                        clamp(selected.needed + 1, 0, 9)
-                    ];
-                    neededValues.forEach((value) => adjustWeight(value, 1.45));
-                }
-            }
-
-            // Anti-sludge guard: in mid/late runs, soften extended low-roll streaks.
-            if (rowsClearedTotal >= 16 && recentTiles.length >= 8) {
-                const rollingWindow = recentTiles.slice(-10);
-                const avg = rollingWindow.reduce((sum, value) => sum + value, 0) / rollingWindow.length;
-                const difficulty = getDifficulty(rowsClearedTotal);
-                const lowStreakThreshold = 2.9 + (difficulty * 1.4);
-                if (avg < lowStreakThreshold) {
-                    adjustWeight(0, 0.92);
-                    adjustWeight(1, 0.88);
-                    adjustWeight(2, 0.88);
-                    [5, 6, 7, 8].forEach((value) => adjustWeight(value, 1.12));
-                }
-            }
-
-            return weightedPick(baseWeights);
-        };
-
-        const getDifficulty = (rowsClearedTotal) => Math.min(rowsClearedTotal / TARGET_ROW_COUNT, 1);
-        const softenLateWeight = (earlyWeight, lateWeight) => earlyWeight + ((lateWeight - earlyWeight) * TARGET_RAMP_SOFTENING);
-        const getTargetWeights = (difficulty) => {
-            const earlyWeights = {
-                low: 0.15,
-                lowMid: 0.40,
-                mid: 0.28,
-                high: 0.12,
-                veryHigh: 0.05
-            };
-            const lateWeights = {
-                low: 0.04,
-                lowMid: 0.24,
-                mid: 0.34,
-                high: 0.24,
-                veryHigh: 0.14
-            };
-            const softenedLateWeights = Object.fromEntries(
-                Object.keys(earlyWeights).map((key) => [
-                    key,
-                    softenLateWeight(earlyWeights[key], lateWeights[key])
-                ])
-            );
-
-            return {
-                low: lerp(earlyWeights.low, softenedLateWeights.low, difficulty),
-                lowMid: lerp(earlyWeights.lowMid, softenedLateWeights.lowMid, difficulty),
-                mid: lerp(earlyWeights.mid, softenedLateWeights.mid, difficulty),
-                high: lerp(earlyWeights.high, softenedLateWeights.high, difficulty),
-                veryHigh: lerp(earlyWeights.veryHigh, softenedLateWeights.veryHigh, difficulty)
-            };
-        };
-        const normalizeBucketWeights = (weights) => {
-            const total = Object.values(weights).reduce((sum, weight) => sum + weight, 0);
-            if (total <= 0) return weights;
-            return Object.fromEntries(Object.entries(weights).map(([key, value]) => [key, value / total]));
-        };
-        const targetBuckets = {
-            low: [1, 5],
-            lowMid: [6, 12],
-            mid: [13, 18],
-            high: [19, 24],
-            veryHigh: [25, 28]
-        };
-        const bucketNames = Object.keys(targetBuckets);
-
-        const getBucketForTarget = (value) => (
-            bucketNames.find((bucketName) => {
-                const [min, max] = targetBuckets[bucketName];
-                return value >= min && value <= max;
-            }) || null
-        );
-
-        const pickDifferentBucket = (weights, currentBucket) => {
-            const options = bucketNames
-                .filter((bucketName) => bucketName !== currentBucket)
-                .map((bucketName) => ({ value: bucketName, weight: Math.max(weights[bucketName] || 0.01, 0.01) }));
-            return weightedPick(options);
-        };
-
-        const generateTarget = (rowsClearedTotal = 0) => {
-            const difficulty = getDifficulty(rowsClearedTotal);
-            const weights = normalizeBucketWeights(getTargetWeights(difficulty));
-            const selectedBucket = weightedPick([
-                { value: 'low', weight: weights.low },
-                { value: 'lowMid', weight: weights.lowMid },
-                { value: 'mid', weight: weights.mid },
-                { value: 'high', weight: weights.high },
-                { value: 'veryHigh', weight: weights.veryHigh }
-            ]);
-            const [min, max] = targetBuckets[selectedBucket];
-            return randomInt(min, max);
-        };
-        const generateTargetExcluding = (excludedValue, rowsClearedTotal = 0) => {
-            let nextTarget = generateTarget(rowsClearedTotal);
-            while (nextTarget === excludedValue) {
-                nextTarget = generateTarget(rowsClearedTotal);
-            }
-            return nextTarget;
-        };
-        let lastSwapGenerationMode = null;
-        const generateSwapReplacementTarget = (previousValue, rowsClearedTotal = 0, grid = null, conveyor = null, swappedRowIndex = -1) => {
-            const difficulty = getDifficulty(rowsClearedTotal);
-            const weights = normalizeBucketWeights(getTargetWeights(difficulty));
-            const currentBucket = getBucketForTarget(previousValue);
-            const fallback = () => generateTargetExcluding(previousValue, rowsClearedTotal);
-
-            // Clean reroll mode (existing behavior): shift to a different target bucket.
-            const chooseModeC = () => {
-                if (!currentBucket) return fallback();
-                for (let attempt = 0; attempt < 6; attempt++) {
-                    const nextBucket = pickDifferentBucket(weights, currentBucket);
-                    const [min, max] = targetBuckets[nextBucket];
-                    const candidate = randomInt(min, max);
-                    if (candidate !== previousValue) return candidate;
-                }
-                return fallback();
-            };
-
-            if (!grid || !conveyor || grid.length !== ROWS || conveyor.length !== ROWS) {
-                lastSwapGenerationMode = 'clean';
-                return chooseModeC();
-            }
-
-            const rowContext = [];
-            for (let rowIndex = 0; rowIndex < ROWS; rowIndex++) {
-                const row = grid[rowIndex];
-                const fillCount = row.reduce((count, cell) => count + (cell !== null ? 1 : 0), 0);
-                const hasTiles = fillCount > 0;
-                if (!hasTiles) continue;
-                const sum = row.reduce((running, cell) => running + (cell !== null ? cell : 0), 0);
-                const remainingCapacity = COLS - fillCount;
-                const target = conveyor[rowIndex];
-                rowContext.push({
-                    rowIndex,
-                    sum,
-                    fillCount,
-                    remainingCapacity,
-                    hasTiles,
-                    isDeadRow: (sum + (remainingCapacity * 9)) < target
-                });
-            }
-
-            const swappedRow = rowContext.find((row) => row.rowIndex === swappedRowIndex) || null;
-            const lowerRows = rowContext.filter((row) => row.rowIndex > swappedRowIndex);
-
-            const clutchWeight = lastSwapGenerationMode === 'clutch' ? 0.035 : 0.07;
-            const assistWeight = 0.40;
-            const cleanWeight = 1 - (clutchWeight + assistWeight);
-            const selectedMode = weightedPick([
-                { value: 'clutch', weight: clutchWeight },
-                { value: 'assist', weight: assistWeight },
-                { value: 'clean', weight: cleanWeight }
-            ]);
-
-            if (selectedMode === 'clutch' && swappedRow && swappedRow.hasTiles && swappedRow.sum !== previousValue) {
-                lastSwapGenerationMode = 'clutch';
-                return swappedRow.sum;
-            }
-
-            if (selectedMode === 'assist') {
-                const assistCandidates = lowerRows.map((row) => {
-                    let weight = 1 + (row.fillCount * 0.35);
-                    if (row.isDeadRow) weight += 5;
-                    weight += (1 / (row.remainingCapacity + 0.75)) * 2.2;
-                    return { value: row, weight };
-                });
-                if (assistCandidates.length > 0) {
-                    const pickedRow = weightedPick(assistCandidates);
-                    if (pickedRow.sum !== previousValue) {
-                        lastSwapGenerationMode = 'assist';
-                        return pickedRow.sum;
-                    }
-                }
-            }
-
-            lastSwapGenerationMode = 'clean';
-            return chooseModeC();
-        };
-        const createConveyorTargets = (rowsClearedTotal = 0) => {
-            const targets = [];
-            for (let i = 0; i < ROWS; i++) {
-                targets.push(generateTargetExcluding(i > 0 ? targets[i - 1] : null, rowsClearedTotal));
-            }
-            return targets;
-        };
-        const createEmptyGrid = () => Array.from({ length: ROWS }, () => Array(COLS).fill(null));
-        const triangularSeriesByTarget = {
-            3: [1, 2],
-            6: [1, 2, 3],
-            10: [1, 2, 3, 4],
-            15: [1, 2, 3, 4, 5],
-            21: [1, 2, 3, 4, 5, 6],
-            28: [1, 2, 3, 4, 5, 6, 7]
-        };
-        const qualifiesForSeriesBonus = (rowValues, target) => {
-            const requiredSeries = triangularSeriesByTarget[target];
-            if (!requiredSeries) return false;
-
-            // Ignore empty cells/nulls and allow zeros as filler.
-            const presentValues = new Set(rowValues.filter((value) => value !== null && value !== 0));
-            return requiredSeries.every((requiredValue) => presentValues.has(requiredValue));
-        };
-        const isAllClear = (sourceGrid) => sourceGrid.every((row) => row.every((cell) => cell === null));
+        // Keep orchestration aliases in the UI while game logic stays in modules.
+        const randomInt = GameGeneration.randomInt;
+        const lerp = GameGeneration.lerp;
+        const getDifficulty = GameGeneration.getDifficulty;
+        const generateTile = GameGeneration.generateTile;
+        const generateSwapReplacementTarget = GameGeneration.generateSwapReplacementTarget;
+        const createEmptyGrid = GameRules.createEmptyGrid;
 
         const ProgressRing = React.memo(({ durationMs, running, cycleNonce }) => {
             const circleRef = useRef(null);
@@ -671,25 +410,16 @@
         });
 
         const App = () => {
-            const initialTargetState = useRef((() => {
-                const conveyor = createConveyorTargets();
-                return { conveyor, incoming: generateTargetExcluding(conveyor[0]) };
-            })());
+            // Gameplay state (single source of truth): model-shaped data for rules/simulation.
+            const [gameState, setGameState] = useState(() => GameRules.createInitialGameState({ mode: 'direct' }));
+            const { grid, queue, conveyor, incomingTarget, mode, gameOver, score, rowsClearedTotal, advanceCount, swapsAvailable, swapRegenElapsedMs } = gameState;
 
-            // Pure gameplay state mirrors the headless model (serializable and deterministic).
-            const [grid, setGrid] = useState(createEmptyGrid());
+            // UI-only choreography/presentation state.
             const [activeTile, setActiveTile] = useState(null);
-            const [queue, setQueue] = useState([generateTile(), generateTile()]);
             const recentTilesRef = useRef([...queue]);
-            const [conveyor, setConveyor] = useState(initialTargetState.current.conveyor);
-            const [incomingTarget, setIncomingTarget] = useState(initialTargetState.current.incoming);
             const [conveyorAnim, setConveyorAnim] = useState(false);
             const [conveyorAnimShift, setConveyorAnimShift] = useState(1);
             const [conveyorAnimDuration, setConveyorAnimDuration] = useState(400);
-            const [mode, setMode] = useState('direct');
-            const [gameOver, setGameOver] = useState(false);
-            const [score, setScore] = useState(0);
-            const [rowsClearedTotal, setRowsClearedTotal] = useState(0);
             const [guideOpen, setGuideOpen] = useState(true);
             const [animatingDrop, setAnimatingDrop] = useState(null);
             const [demoMode, setDemoMode] = useState(false);
@@ -700,18 +430,30 @@
             const [explodingParticles, setExplodingParticles] = useState([]);
             const [comboText, setComboText] = useState('');
             const [uiScale, setUiScale] = useState(1);
-            const [advanceCount, setAdvanceCount] = useState(0);
             const [resolvingRows, setResolvingRows] = useState([]);
-            const [swapsAvailable, setSwapsAvailable] = useState(SWAP_START);
-            const [swapRegenElapsedMs, setSwapRegenElapsedMs] = useState(0);
             const [swapFeedback, setSwapFeedback] = useState(null);
             const [armedSwapRow, setArmedSwapRow] = useState(null);
             const [swapAnimatingRows, setSwapAnimatingRows] = useState({});
             const [pendingSwapValues, setPendingSwapValues] = useState({});
             const [demoDecisionPulse, setDemoDecisionPulse] = useState(0);
 
+            const updateGameState = useCallback((updater) => {
+                setGameState((prev) => (typeof updater === 'function' ? updater(prev) : updater));
+            }, []);
+            const setGrid = useCallback((updater) => updateGameState((prev) => ({ ...prev, grid: typeof updater === 'function' ? updater(prev.grid) : updater })), [updateGameState]);
+            const setQueue = useCallback((updater) => updateGameState((prev) => ({ ...prev, queue: typeof updater === 'function' ? updater(prev.queue) : updater })), [updateGameState]);
+            const setConveyor = useCallback((updater) => updateGameState((prev) => ({ ...prev, conveyor: typeof updater === 'function' ? updater(prev.conveyor) : updater })), [updateGameState]);
+            const setIncomingTarget = useCallback((updater) => updateGameState((prev) => ({ ...prev, incomingTarget: typeof updater === 'function' ? updater(prev.incomingTarget) : updater })), [updateGameState]);
+            const setMode = useCallback((updater) => updateGameState((prev) => ({ ...prev, mode: typeof updater === 'function' ? updater(prev.mode) : updater })), [updateGameState]);
+            const setGameOver = useCallback((updater) => updateGameState((prev) => ({ ...prev, gameOver: typeof updater === 'function' ? updater(prev.gameOver) : updater })), [updateGameState]);
+            const setScore = useCallback((updater) => updateGameState((prev) => ({ ...prev, score: typeof updater === 'function' ? updater(prev.score) : updater })), [updateGameState]);
+            const setRowsClearedTotal = useCallback((updater) => updateGameState((prev) => ({ ...prev, rowsClearedTotal: typeof updater === 'function' ? updater(prev.rowsClearedTotal) : updater })), [updateGameState]);
+            const setAdvanceCount = useCallback((updater) => updateGameState((prev) => ({ ...prev, advanceCount: typeof updater === 'function' ? updater(prev.advanceCount) : updater })), [updateGameState]);
+            const setSwapsAvailable = useCallback((updater) => updateGameState((prev) => ({ ...prev, swapsAvailable: typeof updater === 'function' ? updater(prev.swapsAvailable) : updater })), [updateGameState]);
+            const setSwapRegenElapsedMs = useCallback((updater) => updateGameState((prev) => ({ ...prev, swapRegenElapsedMs: typeof updater === 'function' ? updater(prev.swapRegenElapsedMs) : updater })), [updateGameState]);
+
             // Refs
-            const stateRef = useRef({ grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount, animatingDrop, demoMode, conveyorAnim, clearingRows, explodingParticles, score, rowsClearedTotal, swapsAvailable, swapRegenElapsedMs, resolvingRows, swapAnimatingRows });
+            const stateRef = useRef({ gameState, grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount, animatingDrop, demoMode, conveyorAnim, clearingRows, explodingParticles, score, rowsClearedTotal, swapsAvailable, swapRegenElapsedMs, resolvingRows, swapAnimatingRows });
             const tickTimerRef = useRef(null);
             const frameRef = useRef(null);
             const directDropCommitRef = useRef(null);
@@ -741,9 +483,14 @@
                 return nextTile;
             }, []);
 
+            const buildModelState = useCallback((overrides = {}) => ({
+                ...stateRef.current.gameState,
+                ...overrides
+            }), []);
+
             useEffect(() => {
-                stateRef.current = { grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount, animatingDrop, demoMode, conveyorAnim, clearingRows, explodingParticles, score, rowsClearedTotal, swapsAvailable, swapRegenElapsedMs, resolvingRows, swapAnimatingRows };
-            }, [grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount, animatingDrop, demoMode, conveyorAnim, clearingRows, explodingParticles, score, rowsClearedTotal, swapsAvailable, swapRegenElapsedMs, resolvingRows, swapAnimatingRows]);
+                stateRef.current = { gameState, grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount, animatingDrop, demoMode, conveyorAnim, clearingRows, explodingParticles, score, rowsClearedTotal, swapsAvailable, swapRegenElapsedMs, resolvingRows, swapAnimatingRows };
+            }, [gameState, grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount, animatingDrop, demoMode, conveyorAnim, clearingRows, explodingParticles, score, rowsClearedTotal, swapsAvailable, swapRegenElapsedMs, resolvingRows, swapAnimatingRows]);
 
             const cancelArmedSwap = useCallback(() => {
                 clearTimeout(armedSwapTimerRef.current);
@@ -810,65 +557,12 @@
                 currentTile !== undefined && currentTile !== null && (rowSum + currentTile) === target
             );
 
-            const getConveyorValueAfterOneStep = (sourceConveyor, sourceIncomingTarget, rowIndex) => (
-                rowIndex === 0 ? sourceIncomingTarget : sourceConveyor[rowIndex - 1]
-            );
-
-            // Find a meaningful contiguous block (non-empty rows only) where all row sums match targetValue.
-            const findContiguousSameSumBlock = (sourceGrid, startRow, targetValue) => {
-                if (startRow < 0 || startRow >= ROWS) return null;
-                if (!rowHasTiles(sourceGrid, startRow)) return null;
-                if (getRowSumFromGrid(sourceGrid, startRow) !== targetValue) return null;
-
-                const prevRow = startRow - 1;
-                const previousIsSame = prevRow >= 0
-                    && rowHasTiles(sourceGrid, prevRow)
-                    && getRowSumFromGrid(sourceGrid, prevRow) === targetValue;
-                if (previousIsSame) return null; // Must be top-most row of the contiguous block.
-
-                let endRow = startRow;
-                while (endRow + 1 < ROWS) {
-                    const nextRow = endRow + 1;
-                    if (!rowHasTiles(sourceGrid, nextRow)) break;
-                    if (getRowSumFromGrid(sourceGrid, nextRow) !== targetValue) break;
-                    endRow = nextRow;
-                }
-
-                return {
-                    startRow,
-                    endRow,
-                    length: endRow - startRow + 1,
-                    sum: targetValue
-                };
-            };
-
-            // Determine if this conveyor event should overrun (skip ahead) past a same-sum adjacent block.
-            const getConveyorAdvanceDistance = (sourceGrid, sourceConveyor, sourceIncomingTarget) => {
-                for (let row = 0; row < ROWS; row++) {
-                    const wouldLandTarget = getConveyorValueAfterOneStep(sourceConveyor, sourceIncomingTarget, row);
-                    const block = findContiguousSameSumBlock(sourceGrid, row, wouldLandTarget);
-                    if (block && block.length >= 2) {
-                        return { distance: block.length, block };
-                    }
-                }
-                return { distance: 1, block: null };
-            };
-
+            const getConveyorAdvanceDistance = GameRules.getConveyorAdvanceDistance;
             const getConveyorAnimationDuration = (shiftCount) => (
                 shiftCount === 1
                     ? 400
                     : Math.min(760, 260 + (shiftCount * 120))
             );
-
-            const buildConveyorAdvanceResult = (sourceConveyor, sourceIncomingTarget, shiftCount, rowsClearedCount) => {
-                let nextConveyor = [...sourceConveyor];
-                let nextIncoming = sourceIncomingTarget;
-                for (let i = 0; i < shiftCount; i++) {
-                    nextConveyor = [nextIncoming, ...nextConveyor.slice(0, -1)];
-                    nextIncoming = generateTargetExcluding(nextConveyor[0], rowsClearedCount);
-                }
-                return { nextConveyor, nextIncoming };
-            };
 
             // For demo forecasting we only trust concrete, currently visible targets:
             // the conveyor itself plus the current incoming target above it.
@@ -1070,16 +764,7 @@
 
             // Intended rule: a row clears when it has at least one tile and its sum
             // equals the row's currently visible conveyor target.
-            const findMatchingRows = (sourceGrid, sourceConveyor) => {
-                const matches = [];
-                for (let r = 0; r < ROWS; r++) {
-                    const hasTiles = sourceGrid[r].some(cell => cell !== null);
-                    if (!hasTiles) continue;
-                    const rowSum = getRowSumFromGrid(sourceGrid, r);
-                    if (rowSum === sourceConveyor[r]) matches.push(r);
-                }
-                return matches;
-            };
+            const findMatchingRows = (sourceGrid, sourceConveyor) => GameRules.findMatchingRows(sourceGrid, sourceConveyor);
 
             const getClearedRowsForMove = (sourceGrid, sourceConveyor) => (
                 findMatchingRows(sourceGrid, sourceConveyor)
@@ -1089,12 +774,7 @@
                 clearedRows.length ? Math.max(...clearedRows) : -1
             );
 
-            const collapseGridForClearedRows = (sourceGrid, clearedRows) => {
-                if (!clearedRows.length) return sourceGrid.map(row => [...row]);
-                const nextGrid = sourceGrid.filter((_, idx) => !clearedRows.includes(idx)).map(row => [...row]);
-                for (let i = 0; i < clearedRows.length; i++) nextGrid.unshift(Array(COLS).fill(null));
-                return nextGrid;
-            };
+            const collapseGridForClearedRows = (sourceGrid, clearedRows) => GameRules.collapseGridForClearedRows(sourceGrid, clearedRows);
 
             const getOccupiedCellCount = (sourceGrid) => sourceGrid.reduce((sum, row) => (
                 sum + row.reduce((rowSum, cell) => rowSum + (cell !== null ? 1 : 0), 0)
@@ -1210,6 +890,9 @@
                 };
             };
 
+            // Model fact vs UI choreography:
+            // - model decides which rows clear + score deltas
+            // - UI decides visual timing/particles/text sequencing.
             const requestResolveVisibleMatches = (gridOverride = null, conveyorOverride = null) => {
                 const workingGrid = gridOverride || stateRef.current.grid;
                 const workingConveyor = conveyorOverride || stateRef.current.conveyor;
@@ -1219,38 +902,36 @@
                     return;
                 }
 
-                const matchingRows = findMatchingRows(workingGrid, workingConveyor);
-                if (matchingRows.length === 0) {
+                const clearStep = GameRules.resolveSingleMatchStep({
+                    ...stateRef.current.gameState,
+                    grid: workingGrid,
+                    conveyor: workingConveyor
+                });
+                if (!clearStep.didClear) {
                     if (resolvePendingRef.current) {
                         resolvePendingRef.current = false;
                         setTimeout(() => requestResolveVisibleMatches(), 0);
                     }
                     return;
                 }
+                const matchingRows = clearStep.rowsCleared;
 
                 resolvingRowsRef.current = true;
                 resolvePendingRef.current = false;
                 cancelArmedSwap();
                 setClearingRows(matchingRows);
                 setResolvingRows(matchingRows);
-
-                // Evaluate bonuses from pre-clear row content.
-                const seriesBonusCount = matchingRows.reduce((count, rowIndex) => (
-                    qualifiesForSeriesBonus(workingGrid[rowIndex], workingConveyor[rowIndex]) ? count + 1 : count
-                ), 0);
-                const cascadeScore = getCascadeScore(matchingRows.length);
-                const seriesBonusScore = seriesBonusCount * SERIES_BONUS_POINTS;
-                const clearEventScore = cascadeScore + seriesBonusScore;
-                setScore((s) => s + clearEventScore);
+                setScore((s) => s + clearStep.scoreDelta);
                 setRowsClearedTotal((rows) => rows + matchingRows.length);
 
                 const clearMessages = [];
                 if (matchingRows.length > 1) {
+                    const cascadeScore = GameScoring.getCascadeScore(matchingRows.length);
                     const comboLabel = matchingRows.length === 2 ? 'DOUBLE CLEAR' : matchingRows.length === 3 ? 'TRIPLE CLEAR' : `CASCADE x${matchingRows.length}`;
                     clearMessages.push(`${comboLabel} +${cascadeScore}`);
                 }
-                if (seriesBonusCount > 0) {
-                    clearMessages.push(`SERIES +${seriesBonusScore}`);
+                if (clearStep.seriesBonusCount > 0) {
+                    clearMessages.push(`SERIES +${clearStep.seriesBonusCount * SERIES_BONUS_POINTS}`);
                 }
                 if (clearMessages.length > 0) {
                     setComboText(clearMessages.join(' • '));
@@ -1274,21 +955,11 @@
 
                 setTimeout(() => {
                     setExplodingParticles(prev => [...prev, ...particlesToSpawn]);
-
-                    const collapsedGrid = workingGrid.filter((_, idx) => !matchingRows.includes(idx));
-                    for (let i = 0; i < matchingRows.length; i++) {
-                        collapsedGrid.unshift(Array(COLS).fill(null));
-                    }
-                    const boardIsEmpty = isAllClear(collapsedGrid);
-                    if (boardIsEmpty) {
-                        if (!allClearAwardedOnEmptyRef.current) {
-                            setScore((s) => s + ALL_CLEAR_BONUS_POINTS);
-                            setComboText(`ALL CLEAR +${ALL_CLEAR_BONUS_POINTS}`);
-                            setTimeout(() => setComboText(''), 1200);
-                            allClearAwardedOnEmptyRef.current = true;
-                        }
-                    } else {
-                        allClearAwardedOnEmptyRef.current = false;
+                    const collapsedGrid = clearStep.nextState.grid;
+                    allClearAwardedOnEmptyRef.current = clearStep.allClear;
+                    if (clearStep.allClear) {
+                        setComboText(`ALL CLEAR +${ALL_CLEAR_BONUS_POINTS}`);
+                        setTimeout(() => setComboText(''), 1200);
                     }
                     setGrid(collapsedGrid);
                     setClearingRows([]);
@@ -1356,19 +1027,11 @@
             };
 
             const simulateDirectDropResult = (sourceGrid, colIndex, valToDrop) => {
-                const simulated = GameRules.simulateDirectDrop({
-                    grid: sourceGrid,
-                    queue: [valToDrop, null],
-                    conveyor: stateRef.current.conveyor,
-                    incomingTarget: stateRef.current.incomingTarget,
-                    mode: stateRef.current.mode,
-                    gameOver: stateRef.current.gameOver,
-                    score: stateRef.current.score,
-                    rowsClearedTotal: stateRef.current.rowsClearedTotal,
-                    advanceCount: stateRef.current.advanceCount,
-                    swapsAvailable: stateRef.current.swapsAvailable,
-                    swapRegenElapsedMs: stateRef.current.swapRegenElapsedMs
-                }, colIndex, valToDrop);
+                const simulated = GameRules.simulateDirectDrop(
+                    buildModelState({ grid: sourceGrid, queue: [valToDrop, null] }),
+                    colIndex,
+                    valToDrop
+                );
                 if (!simulated) return null;
                 return { nextGrid: simulated.nextState.grid, landingRow: simulated.landingRow, colIndex };
             };
@@ -1945,19 +1608,15 @@
             };
 
             const chooseDemoColumn = (sourceGrid, sourceConveyor, sourceIncomingTarget, currentTile, nextTile, rowsClearedCount) => {
-                const gameState = {
+                const gameState = buildModelState({
                     grid: sourceGrid.map((row) => [...row]),
                     queue: [currentTile, nextTile],
                     conveyor: [...sourceConveyor],
                     incomingTarget: sourceIncomingTarget,
                     mode: 'direct',
                     gameOver: false,
-                    score: stateRef.current.score,
-                    rowsClearedTotal: rowsClearedCount || 0,
-                    advanceCount: stateRef.current.advanceCount,
-                    swapsAvailable: stateRef.current.swapsAvailable,
-                    swapRegenElapsedMs: stateRef.current.swapRegenElapsedMs
-                };
+                    rowsClearedTotal: rowsClearedCount || 0
+                });
                 return GameDemoApi.chooseDemoColumn(gameState, (baseState, simulated, evalTile, evalNextTile) => (
                     evaluateSimulatedMove(
                         baseState.grid,
@@ -2092,24 +1751,18 @@
                     return;
                 }
 
-                const oldTarget = stateRef.current.conveyor[rowIndex];
-                const replacement = generateSwapReplacementTarget(
-                    oldTarget,
-                    stateRef.current.rowsClearedTotal,
-                    stateRef.current.grid,
-                    stateRef.current.conveyor,
-                    rowIndex
-                );
+                const swapResult = GameRules.applyAction(stateRef.current.gameState, { type: 'APPLY_SWAP', rowIndex });
+                if (!swapResult.applied) return false;
+                const oldTarget = swapResult.oldTarget;
+                const replacement = swapResult.replacement;
 
                 clearTimeout(swapMidpointTimersRef.current[rowIndex]);
                 clearTimeout(swapEndTimersRef.current[rowIndex]);
                 cancelArmedSwap();
                 setPendingSwapValues((prev) => ({ ...prev, [rowIndex]: replacement }));
                 setSwapAnimatingRows((prev) => ({ ...prev, [rowIndex]: true }));
-                setSwapsAvailable((prev) => Math.max(0, prev - 1));
-                setSwapRegenElapsedMs((prevElapsed) => (
-                    stateRef.current.swapsAvailable === SWAP_CAP ? 0 : prevElapsed
-                ));
+                setSwapsAvailable(swapResult.nextState.swapsAvailable);
+                setSwapRegenElapsedMs(swapResult.nextState.swapRegenElapsedMs);
 
                 swapMidpointTimersRef.current[rowIndex] = setTimeout(() => {
                     setConveyor((prev) => {
@@ -2274,30 +1927,12 @@
                 clearDemoSwapStaging();
             }, [demoMode, gameOver, guideOpen, mode, clearDemoSwapStaging]);
 
-            const getCascadeScore = (clearedRows) => {
-                const base = clearedRows * 100;
-                const bonus = clearedRows > 1 ? (clearedRows - 1) * clearedRows * 50 : 0;
-                return base + bonus;
-            };
-
             // Conveyor movement: once the shift is visible, resolve matches against the now-visible targets.
             const evaluateRowsAndAdvance = () => {
                 const { grid, conveyor, incomingTarget, advanceCount, rowsClearedTotal } = stateRef.current;
-                const modelAdvance = GameRules.advanceConveyorState({
-                    grid,
-                    queue: stateRef.current.queue,
-                    conveyor,
-                    incomingTarget,
-                    mode: stateRef.current.mode,
-                    gameOver: stateRef.current.gameOver,
-                    score: stateRef.current.score,
-                    rowsClearedTotal,
-                    advanceCount,
-                    swapsAvailable: stateRef.current.swapsAvailable,
-                    swapRegenElapsedMs: stateRef.current.swapRegenElapsedMs
-                });
-                const shiftCount = modelAdvance.shiftDistance;
-                const animDuration = modelAdvance.animationDuration;
+                const modelAdvance = GameRules.applyAction(stateRef.current.gameState, { type: 'ADVANCE_CONVEYOR' });
+                const shiftCount = modelAdvance.meta.shiftDistance;
+                const animDuration = getConveyorAnimationDuration(shiftCount);
 
                 cancelArmedSwap();
                 setConveyorAnimShift(shiftCount);
@@ -2334,21 +1969,9 @@
 
                 swapRegenTickRef.current = setInterval(() => {
                     const current = stateRef.current;
-                    if (current.swapsAvailable >= SWAP_CAP) {
-                        if (current.swapRegenElapsedMs !== SWAP_REGEN_MS) {
-                            setSwapRegenElapsedMs(SWAP_REGEN_MS);
-                        }
-                        return;
-                    }
-
-                    setSwapRegenElapsedMs((prevElapsed) => {
-                        const updatedElapsed = prevElapsed + 250;
-                        if (updatedElapsed >= SWAP_REGEN_MS) {
-                            setSwapsAvailable((prevSwaps) => Math.min(SWAP_CAP, prevSwaps + 1));
-                            return 0;
-                        }
-                        return updatedElapsed;
-                    });
+                    const tick = GameRules.applyAction(current.gameState, { type: 'TICK_SWAP_REGEN', elapsedMs: 250 });
+                    setSwapsAvailable(tick.nextState.swapsAvailable);
+                    setSwapRegenElapsedMs(tick.nextState.swapRegenElapsedMs);
                 }, 250);
 
                 return () => clearInterval(swapRegenTickRef.current);
@@ -2361,32 +1984,20 @@
                 cancelArmedSwap();
                 resolvePendingRef.current = false;
                 resolvingRowsRef.current = false;
-                setGrid(createEmptyGrid());
-                const nextConveyor = createConveyorTargets(0);
-                setConveyor(nextConveyor);
-                setIncomingTarget(generateTargetExcluding(nextConveyor[0], 0));
+                const nextModelState = GameRules.createInitialGameState({ mode: nextMode });
+                setGameState(nextModelState);
                 setActiveTile(null);
-                const firstTile = generateTile();
-                const secondTile = generateTile();
-                recentTilesRef.current = [firstTile, secondTile];
-                setQueue([firstTile, secondTile]);
-                setGameOver(false);
+                recentTilesRef.current = [...nextModelState.queue];
                 setConveyorAnim(false);
                 setConveyorAnimShift(1);
                 setConveyorAnimDuration(400);
-                setScore(0);
                 setTickCycle(0);
                 setClearingRows([]);
                 setExplodingParticles([]);
                 setComboText('');
-                setAdvanceCount(0);
-                setRowsClearedTotal(0);
                 setAnimatingDrop(null);
-                setMode(nextMode);
                 setDemoMode(nextDemoMode);
                 setResolvingRows([]);
-                setSwapsAvailable(SWAP_START);
-                setSwapRegenElapsedMs(0);
                 setSwapFeedback(null);
                 setSwapAnimatingRows({});
                 setPendingSwapValues({});
@@ -2398,7 +2009,7 @@
                 swapEndTimersRef.current = {};
                 demoSwapPauseUntilRef.current = 0;
                 allClearAwardedOnEmptyRef.current = false;
-                lastSwapGenerationMode = null;
+                GameGeneration.resetLastSwapGenerationMode();
             };
 
             const restart = () => {

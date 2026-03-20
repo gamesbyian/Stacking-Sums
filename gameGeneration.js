@@ -1,5 +1,7 @@
 (function(global){
   const C = global.GAME_CONSTANTS;
+
+  // ===== Generic RNG/math helpers (no game semantics) =====
   const randomInt = (min, max, rng = Math.random) => Math.floor(rng() * (max - min + 1)) + min;
   const lerp = (a, b, t) => a + (b - a) * t;
   const clamp = (v,min,max)=>Math.max(min,Math.min(max,v));
@@ -12,6 +14,7 @@
     }
     return weightedValues[weightedValues.length - 1].value;
   };
+  // ===== Difficulty & target distribution economy =====
   const getDifficulty = (rowsClearedTotal) => Math.min(rowsClearedTotal / C.TARGET_ROW_COUNT, 1);
   const softenLateWeight = (earlyWeight, lateWeight) => earlyWeight + ((lateWeight - earlyWeight) * C.TARGET_RAMP_SOFTENING);
   const targetBuckets={low:[1,5],lowMid:[6,12],mid:[13,18],high:[19,24],veryHigh:[25,28]};
@@ -42,6 +45,7 @@
   };
   const generateTargetExcluding=(excludedValue,rowsClearedTotal=0,rng=Math.random)=>{let t=generateTarget(rowsClearedTotal,rng); while(t===excludedValue){t=generateTarget(rowsClearedTotal,rng);} return t;};
 
+  // ===== Swap-specific target generation (board-aware) =====
   let lastSwapGenerationMode=null;
   const generateSwapReplacementTarget=(previousValue,rowsClearedTotal=0,grid=null,conveyor=null,swappedRowIndex=-1,rng=Math.random)=>{
     const difficulty=getDifficulty(rowsClearedTotal);
@@ -67,6 +71,7 @@
     lastSwapGenerationMode='clean'; return chooseModeC();
   };
 
+  // ===== Tile generation (includes board-aware soft assistance) =====
   const generateTile=({rowsClearedTotal=0,grid=null,conveyor=null,recentTiles=[]}={},rng=Math.random)=>{
     const base=[{value:0,weight:7},{value:1,weight:12},{value:2,weight:12},{value:3,weight:11},{value:4,weight:10},{value:5,weight:9},{value:6,weight:8},{value:7,weight:5},{value:8,weight:4},{value:9,weight:3}].map((e)=>({...e}));
     const adjust=(v,f)=>{const found=base.find((e)=>e.value===v); if(found) found.weight=Math.max(0.1,found.weight*f);};
@@ -78,6 +83,7 @@
     return weightedPick(base,rng);
   };
 
+  // ===== Conveyor bootstrap helpers =====
   const createConveyorTargets=(rowsClearedTotal=0,rng=Math.random)=>{const targets=[]; for(let i=0;i<C.ROWS;i++){targets.push(generateTargetExcluding(i>0?targets[i-1]:null,rowsClearedTotal,rng));} return targets;};
 
   global.GameGeneration={randomInt,lerp,weightedPick,clamp,getDifficulty,generateTile,generateTarget,generateTargetExcluding,generateSwapReplacementTarget,createConveyorTargets,getLastSwapGenerationMode:()=>lastSwapGenerationMode,resetLastSwapGenerationMode:()=>{lastSwapGenerationMode=null;}};
